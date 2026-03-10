@@ -278,7 +278,8 @@ class ShopifyClient:
     def _enrich_inventory_levels(self, inventory_levels):
         """Attach product metadata to each inventory row for UI display."""
         try:
-            products = self.get_products(fetch_all=True).get("products", [])
+            # Inventory should only surface active products.
+            products = self.get_products(status="active", fetch_all=True).get("products", [])
         except Exception:
             # Never fail inventory endpoint only because product enrichment failed.
             products = []
@@ -300,7 +301,8 @@ class ShopifyClient:
         for level in inventory_levels:
             item_id = level.get("inventory_item_id")
             metadata = variant_index.get(item_id, {})
-            enriched.append({**level, **metadata})
+            if metadata:
+                enriched.append({**level, **metadata})
         return enriched
 
     def get_inventory_levels(self, location_ids=None):
@@ -345,7 +347,7 @@ class ShopifyClient:
 
                 # Fallback: derive inventory from product variants when inventory_levels API is unavailable.
                 try:
-                    products = self.get_products(fetch_all=True).get("products", [])
+                    products = self.get_products(status="active", fetch_all=True).get("products", [])
                 except Exception:
                     products = []
                 fallback_levels = []
