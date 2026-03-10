@@ -1,0 +1,1 @@
+const url = query ? `${API_BASE_URL}/products/${query}` : `${API_BASE_URL}/products`;
