@@ -61,6 +61,41 @@ class ShopifyClient:
         if not SHOP_NAME:
             raise ValueError("Missing SHOPIFY_SHOP_NAME in .env")
 
+    # =========================================================
+    # GRAPHQL
+    # =========================================================
+
+    def graphql(self, query: str, variables: dict = None) -> dict:
+        """
+        Execute a Shopify Admin GraphQL query or mutation.
+        Returns the contents of the top-level `data` key.
+        Raises on HTTP errors and on GraphQL-level errors.
+        """
+        url = f"https://{SHOP_NAME}.myshopify.com/admin/api/{API_VERSION}/graphql.json"
+
+        payload = {"query": query}
+        if variables:
+            payload["variables"] = variables
+
+        r = requests.post(url, headers=_headers(), json=payload, timeout=60)
+
+        if r.status_code == 401:
+            _refresh_token()
+            r = requests.post(url, headers=_headers(), json=payload, timeout=60)
+
+        r.raise_for_status()
+
+        result = r.json()
+
+        if "errors" in result:
+            raise Exception(result["errors"])
+
+        return result.get("data", {})
+
+    # =========================================================
+    # PRODUCTS (REST)
+    # =========================================================
+
     def get_products(self, limit=None, status=None, title=None, fetch_all=True):
         params = {}
         if limit is not None:
@@ -170,6 +205,10 @@ class ShopifyClient:
         r.raise_for_status()
         return r.json()
 
+    # =========================================================
+    # COLLECTIONS (REST)
+    # =========================================================
+
     def get_custom_collections(self, limit=50):
         r = requests.get(
             f"{BASE_URL}/custom_collections.json",
@@ -269,6 +308,10 @@ class ShopifyClient:
                     json={"collect": {"product_id": pid, "collection_id": col_id}},
                 )
         return result
+
+    # =========================================================
+    # INVENTORY (REST)
+    # =========================================================
 
     def get_locations(self):
         r = requests.get(f"{BASE_URL}/locations.json", headers=_headers())

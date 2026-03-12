@@ -2,9 +2,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import os
+
 load_dotenv()
+
 from routes import products, collections, inventory, upload
-load_dotenv()
+from routes import export
 
 app = FastAPI(
     title="Shopify Product Manager API",
@@ -27,6 +29,8 @@ app.include_router(products.router, prefix="/api/products", tags=["Products"])
 app.include_router(collections.router, prefix="/api/collections", tags=["Collections"])
 app.include_router(inventory.router, prefix="/api/inventory", tags=["Inventory"])
 app.include_router(upload.router, prefix="/api/upload", tags=["Upload"])
+app.include_router(export.router, prefix="/api/export", tags=["Export"])
+
 
 @app.get("/")
 async def root():
@@ -36,9 +40,11 @@ async def root():
         "version": "1.0.0"
     }
 
+
 @app.get("/health")
 async def health_check():
     return {"status": "healthy"}
+
 
 if __name__ == "__main__":
     import uvicorn
