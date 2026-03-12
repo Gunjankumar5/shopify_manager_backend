@@ -1,6 +1,7 @@
 import time
 import os
 import io
+import tempfile
 import requests
 import pandas as pd
 from datetime import datetime, timezone
@@ -12,9 +13,6 @@ except Exception:
     import json
 
 from shopify_client import ShopifyClient
-
-SNAPSHOT_DIR = "snapshots"
-os.makedirs(SNAPSHOT_DIR, exist_ok=True)
 
 
 class BulkFetchService:
@@ -42,7 +40,10 @@ class BulkFetchService:
         log("Downloading JSONL...")
         file_path = self._download_jsonl(op["url"], "products_bulk.jsonl")
 
-        rows, snapshot = self._parse_jsonl(file_path)
+        try:
+            rows, snapshot = self._parse_jsonl(file_path)
+        finally:
+            os.unlink(file_path)
         log(f"Parsed {len(snapshot)} products, {len(rows)} variants.")
 
         log("Fetching locations...")
@@ -247,17 +248,19 @@ class BulkFetchService:
 
     def _download_jsonl(self, url, filename):
 
-        path = os.path.join(SNAPSHOT_DIR, filename)
-
-        with requests.get(url, stream=True, timeout=120) as r:
-            r.raise_for_status()
-
-            with open(path, "wb") as f:
+        tmp = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
+        try:
+            with requests.get(url, stream=True, timeout=120) as r:
+                r.raise_for_status()
                 for chunk in r.iter_content(1024 * 1024):
                     if chunk:
-                        f.write(chunk)
-
-        return path
+                        tmp.write(chunk)
+            tmp.close()
+            return tmp.name
+        except Exception:
+            tmp.close()
+            os.unlink(tmp.name)
+            raise
 
     # =========================================================
     # PARSE JSONL
