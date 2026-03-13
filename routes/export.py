@@ -89,6 +89,7 @@ def start_sync(body: Dict[str, Any]):
 
     session_id = str(uuid.uuid4())
     get_queue(session_id)  # register BEFORE thread starts
+    print(f"[EXCEL_SYNC] start requested session={session_id} rows={len(rows)}")
 
     thread = threading.Thread(
         target=run_sync,
@@ -96,6 +97,7 @@ def start_sync(body: Dict[str, Any]):
         daemon=True,
     )
     thread.start()
+    print(f"[EXCEL_SYNC] worker started session={session_id}")
 
     return {"session_id": session_id, "status": "running"}
 
@@ -105,10 +107,12 @@ def start_sync(body: Dict[str, Any]):
 @router.websocket("/sync/progress")
 async def sync_progress_ws(websocket: WebSocket, session: str = ""):
     await websocket.accept()
+    print(f"[EXCEL_SYNC] ws connected session={session or 'missing'}")
 
     if not session:
         await websocket.send_text(json.dumps({"error": "session param required"}))
         await websocket.close()
+        print("[EXCEL_SYNC] ws rejected reason=missing session")
         return
 
     # Wait up to 10s for queue
@@ -123,6 +127,7 @@ async def sync_progress_ws(websocket: WebSocket, session: str = ""):
     if queue is None:
         await websocket.send_text(json.dumps({"error": "Session not found"}))
         await websocket.close()
+        print(f"[EXCEL_SYNC] ws rejected session={session} reason=Session not found")
         return
 
     try:
@@ -152,11 +157,12 @@ async def sync_progress_ws(websocket: WebSocket, session: str = ""):
             await websocket.send_text(msg)
 
     except WebSocketDisconnect:
-        pass
+        print(f"[EXCEL_SYNC] ws disconnected session={session}")
     except Exception as e:
         print(f"[WS] sync/progress error: {e}")
     finally:
         remove_queue(session)
+        print(f"[EXCEL_SYNC] ws closed session={session}")
         try:
             await websocket.close()
         except Exception:

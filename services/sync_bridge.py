@@ -23,6 +23,11 @@ _queues: dict[str, Queue] = {}
 _lock = threading.Lock()
 
 
+def _log(msg: str):
+    """Print sync logs with a consistent prefix for easy terminal filtering."""
+    print(f"[EXCEL_SYNC] {msg}")
+
+
 def get_queue(session_id: str) -> Queue:
     with _lock:
         q = Queue()
@@ -126,6 +131,7 @@ def run_sync(session_id: str, rows: list[dict], snapshot: dict):
 
     counts = {"total": 0, "updated": 0, "skipped": 0, "errors": 0}
     start_time = time.time()
+    _log(f"session={session_id} started rows={len(rows)}")
 
     try:
         client = ShopifyClient()
@@ -147,6 +153,9 @@ def run_sync(session_id: str, rows: list[dict], snapshot: dict):
                     "error": "Missing Product ID",
                 })
                 counts["skipped"] += 1
+                _log(
+                    f"session={session_id} row={idx + 1}/{len(rows)} status=SKIPPED reason=Missing Product ID"
+                )
                 continue
 
             try:
@@ -161,6 +170,9 @@ def run_sync(session_id: str, rows: list[dict], snapshot: dict):
                         "error": None,
                     })
                     counts["skipped"] += 1
+                    _log(
+                        f"session={session_id} row={idx + 1}/{len(rows)} status=SKIPPED reason=No changes"
+                    )
                     continue
 
                 change_list = []
@@ -183,6 +195,9 @@ def run_sync(session_id: str, rows: list[dict], snapshot: dict):
                     "error": None,
                 })
                 counts["updated"] += 1
+                _log(
+                    f"session={session_id} row={idx + 1}/{len(rows)} status=UPDATED changes={','.join(change_list)}"
+                )
 
             except Exception as row_err:
                 push({
@@ -193,6 +208,9 @@ def run_sync(session_id: str, rows: list[dict], snapshot: dict):
                     "error": str(row_err),
                 })
                 counts["errors"] += 1
+                _log(
+                    f"session={session_id} row={idx + 1}/{len(rows)} status=ERROR error={row_err}"
+                )
 
         # Summary
         push({
@@ -206,6 +224,16 @@ def run_sync(session_id: str, rows: list[dict], snapshot: dict):
             "conflicts":        0,
             "duration_seconds": round(time.time() - start_time, 2),
         })
+        _log(
+            "session={} finished total={} updated={} skipped={} errors={} duration={}s".format(
+                session_id,
+                counts["total"],
+                counts["updated"],
+                counts["skipped"],
+                counts["errors"],
+                round(time.time() - start_time, 2),
+            )
+        )
 
     except Exception as e:
         err = str(e)
@@ -215,7 +243,7 @@ def run_sync(session_id: str, rows: list[dict], snapshot: dict):
             "auth_error": "401" in err or "Unauthorized" in err,
             "traceback": traceback.format_exc(),
         })
-        print(f"[SYNC_BRIDGE] Fatal error: {e}")
+        _log(f"session={session_id} fatal_error={e}")
 
     finally:
         if queue:
