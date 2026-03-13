@@ -42,5 +42,9 @@ Thumbs.db
 *.sqlite3
 *.db
 
+# Runtime store data (contains API keys and access tokens — never commit)
+data/stores.json
+data/active_store.json
+
 # Node artifacts (if frontend scripts are used in this folder)
 node_modules/
