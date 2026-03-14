@@ -4,6 +4,7 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+from typing import Any, Dict, Optional
 
 
 env_path = Path(__file__).parent / ".env"
@@ -13,7 +14,6 @@ SHOP_NAME = os.getenv("SHOPIFY_SHOP_NAME")
 API_KEY = os.getenv("SHOPIFY_API_KEY")
 CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET")
 API_VERSION = os.getenv("SHOPIFY_API_VERSION") or "2026-01"
-BASE_URL = f"https://{SHOP_NAME}.myshopify.com/admin/api/{API_VERSION}"
 
 _cache = {
     "token": os.getenv("SHOPIFY_API_PASSWORD"),
@@ -57,31 +57,49 @@ def _headers():
 
 
 class ShopifyClient:
-    def __init__(self):
-        if not SHOP_NAME:
-            raise ValueError("Missing SHOPIFY_SHOP_NAME in .env")
+    def __init__(self, shop_name=None, access_token=None, api_version="2026-01"):
+        """Initialize Shopify client.
+        
+        Args:
+            shop_name: Store name (e.g., 'mystore.myshopify.com' or 'mystore')
+            access_token: Access token for API authentication
+            api_version: Shopify API version (default: 2026-01)
+        """
+        self.shop_name = shop_name or SHOP_NAME
+        self.access_token = access_token
+        self.api_version = api_version
+
+        if not self.shop_name:
+            raise ValueError("Missing shop_name. Provide as parameter or set SHOPIFY_SHOP_NAME in .env")
+
+        if not self.shop_name.endswith(".myshopify.com"):
+            self.shop_name = f"{self.shop_name}.myshopify.com"
 
     # =========================================================
     # GRAPHQL
     # =========================================================
 
-    def graphql(self, query: str, variables: dict = None) -> dict:
+    def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Execute a Shopify Admin GraphQL query or mutation.
         Returns the contents of the top-level `data` key.
         Raises on HTTP errors and on GraphQL-level errors.
         """
-        url = f"https://{SHOP_NAME}.myshopify.com/admin/api/{API_VERSION}/graphql.json"
+        url = f"{self._get_base_url()}/graphql.json"
 
-        payload = {"query": query}
+        payload: Dict[str, Any] = {"query": query}
         if variables:
             payload["variables"] = variables
 
-        r = requests.post(url, headers=_headers(), json=payload, timeout=60)
+        r = requests.post(url, headers=self._get_headers(), json=payload, timeout=60)
 
-        if r.status_code == 401:
-            _refresh_token()
-            r = requests.post(url, headers=_headers(), json=payload, timeout=60)
+        # If unauthorized and no explicit access_token provided, attempt a token refresh
+        if r.status_code == 401 and not self.access_token:
+            try:
+                _refresh_token()
+                r = requests.post(url, headers=self._get_headers(), json=payload, timeout=60)
+            except Exception:
+                pass
 
         r.raise_for_status()
 
@@ -95,83 +113,126 @@ class ShopifyClient:
     # =========================================================
     # PRODUCTS (REST)
     # =========================================================
+    # =========================================================
+    # PRODUCTS (REST)
+    # =========================================================
+    def _get_base_url(self):
+        """Get the base URL for API calls"""
+        return f"https://{self.shop_name}/admin/api/{self.api_version}"
+    
+    def _get_headers(self):
+        """Get headers for API requests"""
+        # Use provided token, otherwise fall back to env token
+        token = self.access_token or _get_token()
+        return {
+            "X-Shopify-Access-Token": token,
+            "Content-Type": "application/json",
+        }
 
-    def get_products(self, limit=None, status=None, title=None, fetch_all=True):
-        params = {}
-        if limit is not None:
-            params["limit"] = min(limit, 250)
+    def get_products(self, limit=None, status=None, title=None, fetch_all=False):
+        """Fetch products using Shopify cursor pagination.
+
+        fetch_all=False  → first page only (250 items, very fast).
+        fetch_all=True   → all pages via Link: next cursor.
+        limit            → cap final result count (independent of pagination).
+        """
+        import logging as _log
+
+        page_size = 250  # Shopify hard max per request
+        all_products = []
+
+        params = {
+            "limit": page_size,
+            "fields": "id,title,vendor,status,handle,image,images,variants",
+        }
         if status and status != "any":
             params["status"] = status
         if title:
             params["title"] = title
 
-        if not fetch_all:
-            r = requests.get(f"{BASE_URL}/products.json", headers=_headers(), params=params)
-            if r.status_code == 401:
-                _refresh_token()
-                r = requests.get(f"{BASE_URL}/products.json", headers=_headers(), params=params)
-            r.raise_for_status()
-            return r.json()
+        next_url = f"{self._get_base_url()}/products.json"
+        page_num = 0
 
-        all_products = []
-        next_url = f"{BASE_URL}/products.json"
+        try:
+            while next_url:
+                page_num += 1
+                _log.info(f"[ShopifyClient] Page {page_num}: fetching products…")
 
-        def _request_products_page(url, is_first_request):
-            """Retry transient Shopify failures so pagination doesn't abort entire tasks."""
-            max_attempts = 3
-            for attempt in range(1, max_attempts + 1):
-                try:
-                    if is_first_request:
-                        response = requests.get(url, headers=_headers(), params=params, timeout=30)
-                    else:
-                        response = requests.get(url, headers=_headers(), timeout=30)
+                # Small delay between pages to respect Shopify's rate limit (2 req/s)
+                if page_num > 1:
+                    time.sleep(0.6)
 
-                    if response.status_code == 401:
-                        _refresh_token()
-                        if is_first_request:
-                            response = requests.get(url, headers=_headers(), params=params, timeout=30)
-                        else:
-                            response = requests.get(url, headers=_headers(), timeout=30)
+                retries = 0
+                while True:
+                    r = requests.get(
+                        next_url,
+                        headers=self._get_headers(),
+                        params=params if page_num == 1 else None,
+                        timeout=20,
+                    )
+                    if r.status_code == 429 and retries < 5:
+                        wait = float(r.headers.get("Retry-After", 2))
+                        _log.warning(f"[ShopifyClient] 429 rate limited — waiting {wait}s (retry {retries+1})")
+                        time.sleep(wait)
+                        retries += 1
+                        continue
+                    if r.status_code == 401 and retries == 0:
+                        _log.warning("[ShopifyClient] 401 — retrying once with fresh headers")
+                        retries += 1
+                        continue
+                    break
 
-                    if response.status_code in (429, 500, 502, 503, 504):
-                        if attempt < max_attempts:
-                            time.sleep(1.5 * attempt)
-                            continue
+                r.raise_for_status()
+                batch = r.json().get("products", [])
+                all_products.extend(batch)
+                _log.info(f"[ShopifyClient] Page {page_num}: +{len(batch)} → total {len(all_products)}")
 
-                    response.raise_for_status()
-                    return response
-                except requests.RequestException:
-                    if attempt >= max_attempts:
-                        raise
-                    time.sleep(1.5 * attempt)
+                # Stop early if last page or fetch_all disabled
+                if not batch or not fetch_all:
+                    break
 
-        while next_url:
-            r = _request_products_page(next_url, next_url == f"{BASE_URL}/products.json")
-            data = r.json()
-            all_products.extend(data.get("products", []))
+                # Shopify cursor: follow Link: rel="next" header
+                next_url = r.links.get("next", {}).get("url")
 
-            next_url = r.links.get("next", {}).get("url")
+                # Stop if explicit limit reached
+                if limit and len(all_products) >= limit:
+                    all_products = all_products[:limit]
+                    break
 
-        return {"products": all_products}
+            if limit:
+                all_products = all_products[:limit]
+
+            _log.info(f"[ShopifyClient] ✅ Done: {len(all_products)} products (pages={page_num})")
+            return {"products": all_products}
+
+        except requests.exceptions.Timeout:
+            _log.error(f"[ShopifyClient] ❌ Timeout after page {page_num} — returning {len(all_products)} so far")
+            return {"products": all_products}
+        except requests.exceptions.HTTPError as e:
+            _log.error(f"[ShopifyClient] ❌ HTTP {e.response.status_code}: {e.response.text[:200]}")
+            return {"products": all_products}
+        except Exception as e:
+            _log.error(f"[ShopifyClient] ❌ Error: {e}")
+            return {"products": all_products}
 
     def search_products(self, query):
         r = requests.get(
-            f"{BASE_URL}/products.json",
-            headers=_headers(),
+            f"{self._get_base_url()}/products.json",
+            headers=self._get_headers(),
             params={"title": query},
         )
         r.raise_for_status()
         return r.json().get("products", [])
 
     def get_product(self, product_id):
-        r = requests.get(f"{BASE_URL}/products/{product_id}.json", headers=_headers())
+        r = requests.get(f"{self._get_base_url()}/products/{product_id}.json", headers=self._get_headers())
         r.raise_for_status()
         return r.json()
 
     def create_product(self, data):
         r = requests.post(
-            f"{BASE_URL}/products.json",
-            headers=_headers(),
+            f"{self._get_base_url()}/products.json",
+            headers=self._get_headers(),
             json={"product": data},
         )
         r.raise_for_status()
@@ -179,29 +240,29 @@ class ShopifyClient:
 
     def update_product(self, product_id, data):
         r = requests.put(
-            f"{BASE_URL}/products/{product_id}.json",
-            headers=_headers(),
+            f"{self._get_base_url()}/products/{product_id}.json",
+            headers=self._get_headers(),
             json={"product": data},
         )
         r.raise_for_status()
         return r.json()
 
     def delete_product(self, product_id):
-        r = requests.delete(f"{BASE_URL}/products/{product_id}.json", headers=_headers())
+        r = requests.delete(f"{self._get_base_url()}/products/{product_id}.json", headers=self._get_headers())
         r.raise_for_status()
         return {"deleted": True}
 
     def update_product_variant(self, product_id, variant_id, data):
         r = requests.put(
-            f"{BASE_URL}/variants/{variant_id}.json",
-            headers=_headers(),
+            f"{self._get_base_url()}/variants/{variant_id}.json",
+            headers=self._get_headers(),
             json={"variant": data},
         )
         r.raise_for_status()
         return r.json()
 
     def count_products(self):
-        r = requests.get(f"{BASE_URL}/products/count.json", headers=_headers())
+        r = requests.get(f"{self._get_base_url()}/products/count.json", headers=self._get_headers())
         r.raise_for_status()
         return r.json()
 
@@ -211,8 +272,8 @@ class ShopifyClient:
 
     def get_custom_collections(self, limit=50):
         r = requests.get(
-            f"{BASE_URL}/custom_collections.json",
-            headers=_headers(),
+            f"{self._get_base_url()}/custom_collections.json",
+            headers=self._get_headers(),
             params={"limit": limit},
         )
         r.raise_for_status()
@@ -220,15 +281,15 @@ class ShopifyClient:
 
     def get_collections(self, limit=50):
         custom = requests.get(
-            f"{BASE_URL}/custom_collections.json",
-            headers=_headers(),
+            f"{self._get_base_url()}/custom_collections.json",
+            headers=self._get_headers(),
             params={"limit": limit},
         )
         custom.raise_for_status()
 
         smart = requests.get(
-            f"{BASE_URL}/smart_collections.json",
-            headers=_headers(),
+            f"{self._get_base_url()}/smart_collections.json",
+            headers=self._get_headers(),
             params={"limit": limit},
         )
         smart.raise_for_status()
@@ -246,16 +307,16 @@ class ShopifyClient:
 
     def get_collection(self, collection_id):
         r = requests.get(
-            f"{BASE_URL}/custom_collections/{collection_id}.json",
-            headers=_headers(),
+            f"{self._get_base_url()}/custom_collections/{collection_id}.json",
+            headers=self._get_headers(),
         )
         r.raise_for_status()
         return r.json()
 
     def create_collection(self, data):
         r = requests.post(
-            f"{BASE_URL}/custom_collections.json",
-            headers=_headers(),
+            f"{self._get_base_url()}/custom_collections.json",
+            headers=self._get_headers(),
             json={"custom_collection": data},
         )
         r.raise_for_status()
@@ -263,8 +324,8 @@ class ShopifyClient:
 
     def update_collection(self, collection_id, data):
         r = requests.put(
-            f"{BASE_URL}/custom_collections/{collection_id}.json",
-            headers=_headers(),
+            f"{self._get_base_url()}/custom_collections/{collection_id}.json",
+            headers=self._get_headers(),
             json={"custom_collection": {"id": collection_id, **data}},
         )
         r.raise_for_status()
@@ -274,8 +335,8 @@ class ShopifyClient:
         collects = []
         for product_id in product_ids:
             r = requests.post(
-                f"{BASE_URL}/collects.json",
-                headers=_headers(),
+                f"{self._get_base_url()}/collects.json",
+                headers=self._get_headers(),
                 json={"collect": {"product_id": product_id, "collection_id": collection_id}},
             )
             r.raise_for_status()
@@ -284,8 +345,8 @@ class ShopifyClient:
 
     def delete_collection(self, collection_id):
         r = requests.delete(
-            f"{BASE_URL}/custom_collections/{collection_id}.json",
-            headers=_headers(),
+            f"{self._get_base_url()}/custom_collections/{collection_id}.json",
+            headers=self._get_headers(),
         )
         r.raise_for_status()
         return {"deleted": True}
@@ -295,7 +356,7 @@ class ShopifyClient:
         if image_url:
             data["custom_collection"]["image"] = {"src": image_url}
 
-        r = requests.post(f"{BASE_URL}/custom_collections.json", headers=_headers(), json=data)
+        r = requests.post(f"{self._get_base_url()}/custom_collections.json", headers=self._get_headers(), json=data)
         r.raise_for_status()
         result = r.json()
 
@@ -303,8 +364,8 @@ class ShopifyClient:
             col_id = result["custom_collection"]["id"]
             for pid in product_ids:
                 requests.post(
-                    f"{BASE_URL}/collects.json",
-                    headers=_headers(),
+                    f"{self._get_base_url()}/collects.json",
+                    headers=self._get_headers(),
                     json={"collect": {"product_id": pid, "collection_id": col_id}},
                 )
         return result
@@ -314,32 +375,54 @@ class ShopifyClient:
     # =========================================================
 
     def get_locations(self):
-        r = requests.get(f"{BASE_URL}/locations.json", headers=_headers())
+        r = requests.get(f"{self._get_base_url()}/locations.json", headers=self._get_headers())
         r.raise_for_status()
         return r.json()
 
-    def _enrich_inventory_levels(self, inventory_levels):
-        """Attach product metadata to each inventory row for UI display."""
-        try:
-            # Inventory should only surface active products.
-            products = self.get_products(status="active", fetch_all=True).get("products", [])
-        except Exception:
-            # Never fail inventory endpoint only because product enrichment failed.
-            products = []
+    def _build_variant_index(self):
+        """Build inventory_item_id → product/variant metadata index.
+
+        Uses a lightweight fields-only product request to keep this fast.
+        Only fetches id, title, variants (inventory_item_id, variant info).
+        """
+        import logging as _log
         variant_index = {}
+        next_url = f"{self._get_base_url()}/products.json"
+        params = {
+            "limit": 250,
+            "status": "active",
+            "fields": "id,title,variants",
+        }
+        page = 0
+        try:
+            while next_url:
+                page += 1
+                r = requests.get(
+                    next_url,
+                    headers=self._get_headers(),
+                    params=params if page == 1 else None,
+                    timeout=20,
+                )
+                r.raise_for_status()
+                for product in r.json().get("products", []):
+                    for v in product.get("variants", []):
+                        iid = v.get("inventory_item_id")
+                        if iid:
+                            variant_index[iid] = {
+                                "product_id":    product.get("id"),
+                                "product_title": product.get("title"),
+                                "variant_id":    v.get("id"),
+                                "variant_title": v.get("title"),
+                            }
+                next_url = r.links.get("next", {}).get("url")
+        except Exception as e:
+            _log.warning(f"[ShopifyClient] variant index build failed: {e}")
+        return variant_index
 
-        for product in products:
-            for variant in product.get("variants", []):
-                inventory_item_id = variant.get("inventory_item_id")
-                if inventory_item_id is None:
-                    continue
-                variant_index[inventory_item_id] = {
-                    "product_id": product.get("id"),
-                    "product_title": product.get("title"),
-                    "variant_id": variant.get("id"),
-                    "variant_title": variant.get("title"),
-                }
-
+    def _enrich_inventory_levels(self, inventory_levels, variant_index=None):
+        """Attach product metadata to each inventory row for UI display."""
+        if variant_index is None:
+            variant_index = self._build_variant_index()
         enriched = []
         for level in inventory_levels:
             item_id = level.get("inventory_item_id")
@@ -349,87 +432,84 @@ class ShopifyClient:
         return enriched
 
     def get_inventory_levels(self, location_ids=None):
-        params = {"limit": 250}
+        import logging as _log
+
+        params: Dict[str, Any] = {"limit": 250}
         if location_ids:
-            if isinstance(location_ids, list):
-                params["location_ids"] = ",".join(str(x) for x in location_ids)
-            else:
-                params["location_ids"] = str(location_ids)
+            params["location_ids"] = ",".join(str(x) for x in location_ids) if isinstance(location_ids, list) else str(location_ids)
         else:
-            # Shopify requires filters for inventory_levels endpoint; default to all known locations.
             try:
-                locations = self.get_locations().get("locations", [])
+                locs = self.get_locations().get("locations", [])
+                ids = [str(loc["id"]) for loc in locs if loc.get("id")]
+                if ids:
+                    params["location_ids"] = ",".join(ids)
             except Exception:
-                locations = []
-            all_location_ids = [str(loc.get("id")) for loc in locations if loc.get("id") is not None]
-            if all_location_ids:
-                params["location_ids"] = ",".join(all_location_ids)
+                pass
+
+        # Build variant index once — reused for enrichment
+        variant_index = self._build_variant_index()
 
         all_levels = []
-        next_url = f"{BASE_URL}/inventory_levels.json"
-        first_request = True
+        next_url = f"{self._get_base_url()}/inventory_levels.json"
+        first = True
 
         while next_url:
-            if first_request:
-                r = requests.get(next_url, headers=_headers(), params=params)
-            else:
-                r = requests.get(next_url, headers=_headers())
-
-            if r.status_code == 401:
-                _refresh_token()
-                if first_request:
-                    r = requests.get(next_url, headers=_headers(), params=params)
-                else:
-                    r = requests.get(next_url, headers=_headers())
-
             try:
+                r = requests.get(
+                    next_url,
+                    headers=self._get_headers(),
+                    params=params if first else None,
+                    timeout=20,
+                )
+                if r.status_code == 401:
+                    r = requests.get(
+                        next_url,
+                        headers=self._get_headers(),
+                        params=params if first else None,
+                        timeout=20,
+                    )
                 r.raise_for_status()
             except requests.HTTPError:
-                if r.status_code not in (422, 500, 502, 503, 504):
-                    raise
-
-                # Fallback: derive inventory from product variants when inventory_levels API is unavailable.
+                # Fallback: derive inventory from variant data already in index
+                _log.warning("[ShopifyClient] inventory_levels API failed, falling back to variant quantities")
+                fallback = []
                 try:
-                    products = self.get_products(status="active", fetch_all=True).get("products", [])
+                    locs = self.get_locations().get("locations", [])
+                    default_loc = locs[0]["id"] if locs else None
                 except Exception:
-                    products = []
-                fallback_levels = []
-                default_location_id = None
+                    default_loc = None
+                # Re-fetch variants with quantity since index only has metadata fields
                 try:
-                    locations = self.get_locations().get("locations", [])
-                except Exception:
-                    locations = []
-                if locations:
-                    default_location_id = locations[0].get("id")
+                    next_p = f"{self._get_base_url()}/products.json"
+                    p1 = {"limit": 250, "status": "active", "fields": "id,variants"}
+                    pg = 0
+                    while next_p:
+                        pg += 1
+                        rp = requests.get(next_p, headers=self._get_headers(), params=p1 if pg == 1 else None, timeout=20)
+                        rp.raise_for_status()
+                        for prod in rp.json().get("products", []):
+                            for v in prod.get("variants", []):
+                                iid = v.get("inventory_item_id")
+                                qty = v.get("inventory_quantity")
+                                if iid is not None and qty is not None:
+                                    fallback.append({"inventory_item_id": iid, "location_id": default_loc, "available": qty})
+                        next_p = rp.links.get("next", {}).get("url")
+                except Exception as fe:
+                    _log.error(f"[ShopifyClient] fallback failed: {fe}")
+                return {"inventory_levels": self._enrich_inventory_levels(fallback, variant_index)}
 
-                for product in products:
-                    for variant in product.get("variants", []):
-                        inv_item_id = variant.get("inventory_item_id")
-                        qty = variant.get("inventory_quantity")
-                        if inv_item_id is None or qty is None:
-                            continue
-                        fallback_levels.append(
-                            {
-                                "inventory_item_id": inv_item_id,
-                                "location_id": default_location_id,
-                                "available": qty,
-                            }
-                        )
-
-                return {"inventory_levels": self._enrich_inventory_levels(fallback_levels)}
-
-            data = r.json()
-            all_levels.extend(data.get("inventory_levels", []))
-
+            batch = r.json().get("inventory_levels", [])
+            all_levels.extend(batch)
+            _log.info(f"[ShopifyClient] inventory page: +{len(batch)} → total {len(all_levels)}")
             next_url = r.links.get("next", {}).get("url")
-            first_request = False
+            first = False
 
-        return {"inventory_levels": self._enrich_inventory_levels(all_levels)}
+        return {"inventory_levels": self._enrich_inventory_levels(all_levels, variant_index)}
 
     def update_inventory(self, inventory_item_id, location_id, available):
         r = requests.post(
-            f"{BASE_URL}/inventory_levels/set.json",
-            headers=_headers(),
+            f"{self._get_base_url()}/inventory_levels/set.json",
+            headers=self._get_headers(),
             json={
                 "location_id": location_id,
                 "inventory_item_id": inventory_item_id,

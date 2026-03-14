@@ -24,8 +24,16 @@ dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+.cache/
 .coverage
 htmlcov/
+
+# Notebook and Python version files
+.ipynb_checkpoints/
+.python-version
 
 # IDE/editor files
 .vscode/
@@ -41,6 +49,12 @@ Thumbs.db
 *.log
 *.sqlite3
 *.db
+*.tmp
+*.temp
+
+# Runtime store data (contains API keys and access tokens — never commit)
+data/stores.json
+data/active_store.json
 
 # Node artifacts (if frontend scripts are used in this folder)
 node_modules/

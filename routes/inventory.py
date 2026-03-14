@@ -1,12 +1,10 @@
 from fastapi import APIRouter, HTTPException, Query
 from typing import Optional, List
-from shopify_client import ShopifyClient
 import logging
+from .store_utils import get_shopify_client
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-shopify = ShopifyClient()
 
 @router.get("/levels")
 async def get_inventory_levels(location_ids: Optional[str] = Query(None)):
@@ -15,12 +13,15 @@ async def get_inventory_levels(location_ids: Optional[str] = Query(None)):
     location_ids: comma-separated list of location IDs (optional)
     """
     try:
+        shopify = get_shopify_client()
         loc_list = None
         if location_ids:
             loc_list = [int(x.strip()) for x in location_ids.split(",")]
 
         result = shopify.get_inventory_levels(location_ids=loc_list)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching inventory levels: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -29,8 +30,11 @@ async def get_inventory_levels(location_ids: Optional[str] = Query(None)):
 async def get_locations():
     """Get all inventory locations"""
     try:
+        shopify = get_shopify_client()
         result = shopify.get_locations()
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error fetching locations: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -49,8 +53,11 @@ async def update_inventory(
         quantity: The new quantity
     """
     try:
+        shopify = get_shopify_client()
         result = shopify.update_inventory(inventory_item_id, location_id, quantity)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error updating inventory: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -69,9 +76,12 @@ async def adjust_inventory(
         adjustment: The quantity adjustment (positive or negative)
     """
     try:
+        shopify = get_shopify_client()
         # Shopify set endpoint expects absolute quantity; for now use provided value directly.
         result = shopify.update_inventory(inventory_item_id, location_id, adjustment)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error adjusting inventory: {e}")
         raise HTTPException(status_code=400, detail=str(e))
@@ -86,6 +96,7 @@ async def bulk_update_inventory(updates: List[dict]):
     - quantity
     """
     try:
+        shopify = get_shopify_client()
         results = []
         errors = []
         
@@ -106,6 +117,8 @@ async def bulk_update_inventory(updates: List[dict]):
             "results": results,
             "errors": errors
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error bulk updating inventory: {e}")
         raise HTTPException(status_code=400, detail=str(e))

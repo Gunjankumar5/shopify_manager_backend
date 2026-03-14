@@ -23,6 +23,7 @@ from services.bulk_fetch import BulkFetchService
 from services.sync_bridge import (
     get_queue, pop_queue, remove_queue, run_sync, DONE_SENTINEL
 )
+from .store_utils import get_shopify_client
 
 router = APIRouter()
 
@@ -83,6 +84,7 @@ def start_sync(body: Dict[str, Any]):
     """
     rows     = body.get("rows", [])
     snapshot = body.get("snapshot", {})
+    shop_key = body.get("shop_key")
 
     if not rows:
         raise HTTPException(status_code=400, detail="No rows provided")
@@ -93,7 +95,7 @@ def start_sync(body: Dict[str, Any]):
 
     thread = threading.Thread(
         target=run_sync,
-        args=(session_id, rows, snapshot),
+        args=(session_id, rows, snapshot, shop_key),
         daemon=True,
     )
     thread.start()
@@ -173,13 +175,11 @@ async def sync_progress_ws(websocket: WebSocket, session: str = ""):
 
 @router.post("/grid-save", summary="Quick push edits to Shopify via REST")
 def grid_save(payload: Dict[str, Any]):
-    from shopify_client import ShopifyClient
-
     changes: List[Dict] = payload.get("changes", [])
     if not changes:
         raise HTTPException(status_code=400, detail="No changes provided")
 
-    client = ShopifyClient()
+    client = get_shopify_client()
     updated, failed, errors = 0, 0, []
 
     for row in changes:
@@ -206,7 +206,7 @@ def grid_save(payload: Dict[str, Any]):
         if row.get("Tags"):        product_payload["tags"]         = row["Tags"]
         if row.get("Status"):      product_payload["status"]       = row["Status"].lower()
 
-        variant_payload = {"id": int(variant_id)}
+        variant_payload = {"id": str(variant_id)}
         if row.get("Variant Price"):            variant_payload["price"]            = str(row["Variant Price"])
         if row.get("Variant Compare At Price"): variant_payload["compare_at_price"] = str(row["Variant Compare At Price"])
         if row.get("Variant SKU"):              variant_payload["sku"]              = row["Variant SKU"]
