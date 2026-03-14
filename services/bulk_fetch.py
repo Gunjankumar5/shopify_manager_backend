@@ -4,20 +4,36 @@ import io
 import tempfile
 import requests
 import pandas as pd
+import importlib
+import json
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
+_orjson = None
 try:
-    import orjson as json
+  _orjson = importlib.import_module("orjson")
 except Exception:
-    import json
+  _orjson = None
 
 from shopify_client import ShopifyClient
+# Prefer using the active connected store's credentials when available
+try:
+  from routes.store_utils import get_shopify_client
+except Exception:
+  get_shopify_client = None
 
 
 class BulkFetchService:
 
     def __init__(self):
+      # Initialise client using active connected store if possible.
+      if get_shopify_client:
+        try:
+          self.client = get_shopify_client()
+        except Exception:
+          # Fallback to env-configured ShopifyClient
+          self.client = ShopifyClient()
+      else:
         self.client = ShopifyClient()
 
     # =========================================================
@@ -266,6 +282,11 @@ class BulkFetchService:
     # PARSE JSONL
     # =========================================================
 
+    def _loads_json(self, raw):
+      if _orjson is not None:
+        return _orjson.loads(raw)
+      return json.loads(raw)
+
     def _parse_jsonl(self, path):
 
         rows = []
@@ -282,7 +303,7 @@ class BulkFetchService:
                 if not line.strip():
                     continue
 
-                obj = json.loads(line)
+                obj = self._loads_json(line)
 
                 obj_id = obj.get("id", "")
 

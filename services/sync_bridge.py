@@ -14,6 +14,7 @@ import traceback
 from queue import Queue
 
 from shopify_client import ShopifyClient
+from routes.store_utils import load_stores, get_active_store_key, get_connected_store
 
 # ─── Sentinel ────────────────────────────────────────────────────────────────
 DONE_SENTINEL = "__SYNC_DONE__"
@@ -110,7 +111,34 @@ def _diff_row(row: dict, snapshot: dict) -> tuple[dict, dict]:
 
 # ─── Main sync worker (runs in thread) ───────────────────────────────────────
 
-def run_sync(session_id: str, rows: list[dict], snapshot: dict):
+def _resolve_store_client(shop_key: str | None = None) -> ShopifyClient:
+    """Resolve Shopify client from selected/active connected store credentials."""
+    store = None
+
+    if shop_key:
+        stores = load_stores()
+        store = stores.get(shop_key)
+
+    if not store:
+        # Fallback to currently active connected store
+        store = get_connected_store()
+
+    if store:
+        shop_name = store.get("shop") or store.get("shop_name")
+        access_token = store.get("access_token")
+        api_version = store.get("api_version", "2026-01")
+        if shop_name and access_token:
+            return ShopifyClient(
+                shop_name=shop_name,
+                access_token=access_token,
+                api_version=api_version,
+            )
+
+    # Last fallback for backward compatibility (env-based client)
+    return ShopifyClient()
+
+
+def run_sync(session_id: str, rows: list[dict], snapshot: dict, shop_key: str | None = None):
     """
     Sync pipeline:
       1. Compare each row against snapshot to find changes
@@ -128,7 +156,7 @@ def run_sync(session_id: str, rows: list[dict], snapshot: dict):
     start_time = time.time()
 
     try:
-        client = ShopifyClient()
+        client = _resolve_store_client(shop_key)
 
         for idx, row in enumerate(rows):
             counts["total"] += 1

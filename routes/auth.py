@@ -1,105 +1,113 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-import requests, time
+import requests
+import time
 import logging
-from .store_utils import load_stores, save_stores, get_active_store_key, set_active_store_key
+from .store_utils import load_stores, save_stores, get_active_store_key, set_active_store_key, get_shopify_client
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
 def generate_access_token(shop: str, api_key: str, api_secret: str, api_version: str = "2026-01"):
-    """Generate access token using client_credentials OAuth flow"""
+    """Try multiple auth methods to connect to Shopify.
+
+    Tries: 1) OAuth client_credentials 2) api_secret as direct access token
+    3) basic auth fallback. Returns dict {access_token, expires_in} on success.
+    """
+    # Method 1: OAuth client_credentials
     try:
-        url = f"https://{shop}/admin/oauth/access_token"
-        payload = {
-            "client_id": api_key,
-            "client_secret": api_secret,
-            "grant_type": "client_credentials",
-            "scope": "write_products,read_products,write_orders,read_orders,write_inventory,read_inventory,write_collections,read_collections"
-        }
-        logger.info(f"Requesting token from {url} with client_id: {api_key[:10]}...")
-        
-        r = requests.post(url, data=payload, timeout=10)
-        logger.info(f"Shopify response: {r.status_code}")
-        
+        r = requests.post(
+            f"https://{shop}/admin/oauth/access_token",
+            data={
+                "client_id": api_key,
+                "client_secret": api_secret,
+                "grant_type": "client_credentials",
+            },
+            timeout=10,
+        )
         if r.status_code == 200:
             data = r.json()
-            logger.info(f"✅ Token generated successfully for {shop}")
-            return {
-                "access_token": data.get("access_token"),
-                "expires_in": data.get("expires_in", 3600),
-                "token_type": data.get("token_type", "Bearer"),
-            }
-        else:
-            error_text = r.text
-            logger.error(f"❌ Shopify OAuth error: {r.status_code} - {error_text}")
-            raise Exception(f"Shopify returned {r.status_code}: {error_text}")
-    except requests.exceptions.Timeout:
-        logger.error(f"❌ Timeout connecting to Shopify")
-        raise Exception("Shopify connection timeout - check your internet and credentials")
-    except requests.exceptions.RequestException as e:
-        logger.error(f"❌ Network error: {e}")
-        raise Exception(f"Network error connecting to Shopify: {str(e)}")
+            token = data.get("access_token")
+            if token:
+                logger.info(f"✅ Token via OAuth client_credentials for {shop}")
+                return {"access_token": token, "expires_in": data.get("expires_in", 3600)}
+        logger.warning(f"OAuth failed: {r.status_code} - {r.text[:100]}")
     except Exception as e:
-        logger.error(f"❌ Error generating token: {e}")
-        raise
+        logger.warning(f"OAuth method failed: {e}")
+
+    # Method 2: api_secret IS the access token (private/custom apps — never expires)
+    try:
+        test = requests.get(
+            f"https://{shop}/admin/api/{api_version}/shop.json",
+            headers={"X-Shopify-Access-Token": api_secret},
+            timeout=10,
+        )
+        if test.status_code == 200:
+            logger.info(f"✅ Token via direct access token for {shop}")
+            return {"access_token": api_secret, "expires_in": 86400 * 365}
+        logger.warning(f"Direct token failed: {test.status_code}")
+    except Exception as e:
+        logger.warning(f"Direct token method failed: {e}")
+
+    # Method 3: basic auth fallback
+    try:
+        test2 = requests.get(
+            f"https://{shop}/admin/api/{api_version}/shop.json",
+            auth=(api_key, api_secret),
+            timeout=10,
+        )
+        if test2.status_code == 200:
+            logger.info(f"✅ Token via basic auth for {shop}")
+            return {"access_token": api_secret, "expires_in": 86400 * 365}
+        logger.warning(f"Basic auth failed: {test2.status_code}")
+    except Exception as e:
+        logger.warning(f"Basic auth method failed: {e}")
+
+    raise HTTPException(
+        status_code=401,
+        detail="Could not authenticate with Shopify. Please check your API Key and Secret/Access Token."
+    )
 
 
 # ── Models ────────────────────────────────────────────────────────────────────
 class ConnectRequest(BaseModel):
-    shop_name: str        # e.g. "mystore" or "mystore.myshopify.com"
+    shop_name: str
     api_key: str
     api_secret: str
     api_version: str = "2026-01"
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Routes — NO /api/auth prefix here; main.py adds prefix="/api/auth" ────────
 
-@router.post("/api/auth/connect")
+@router.post("/connect")
 async def connect_store(req: ConnectRequest):
-    """
-    Accept store credentials, generate access token, and save them locally.
-    Uses Shopify's client_credentials OAuth flow to generate a valid access token.
-    """
-    logger.info(f"🔗 Connect request received for shop: {req.shop_name}")
-    
-    # Normalize shop name
+    logger.info(f"🔗 Connect request for: {req.shop_name}")
+
     shop = req.shop_name.strip().lower()
     if not shop.endswith(".myshopify.com"):
         shop = f"{shop}.myshopify.com"
-
     shop_key = shop.replace(".myshopify.com", "")
 
-    # Generate access token using OAuth client_credentials flow
-    try:
-        logger.info(f"Attempting to generate token for {shop}...")
-        token_data = generate_access_token(shop, req.api_key, req.api_secret, req.api_version)
-        access_token = token_data["access_token"]
-        expires_in = token_data["expires_in"]
-        logger.info(f"✅ Token generated, expires in {expires_in}s")
-    except Exception as e:
-        logger.error(f"❌ Token generation failed: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"Invalid credentials: {str(e)}")
-    
-    # Fetch actual shop info using the generated token
+    token_data = generate_access_token(shop, req.api_key, req.api_secret, req.api_version)
+    access_token = token_data["access_token"]
+    expires_in   = token_data["expires_in"]
+
+    # Fetch shop info
     shop_info = {"name": shop_key}
     try:
-        logger.info(f"Fetching shop info from Shopify...")
         verify = requests.get(
             f"https://{shop}/admin/api/{req.api_version}/shop.json",
             headers={"X-Shopify-Access-Token": access_token},
-            timeout=10
+            timeout=10,
         )
         if verify.status_code == 200:
             shop_info = verify.json().get("shop", {})
-            logger.info(f"✅ Shop info retrieved: {shop_info.get('name')}")
-        else:
-            logger.warning(f"Could not get shop info: {verify.status_code}")
+            logger.info(f"✅ Shop info: {shop_info.get('name')}")
     except Exception as e:
         logger.warning(f"Could not fetch shop info: {e}")
-    
-    # Save to stores.json with all credentials for token refresh
+
+    # Save to stores.json
     stores = load_stores()
     stores[shop_key] = {
         "shop": shop,
@@ -110,45 +118,49 @@ async def connect_store(req: ConnectRequest):
         "token_expires_at": time.time() + expires_in,
         "api_version": req.api_version,
         "connected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "email": shop_info.get("email", ""),
+        "currency": shop_info.get("currency", ""),
     }
     save_stores(stores)
-    
-    # Set this as the active store automatically
     set_active_store_key(shop_key)
-    logger.info(f"✅ Store {shop_key} saved and set as active store")
+    logger.info(f"✅ Store {shop_key} saved and set as active")
 
     return {
         "success": True,
         "shop": shop,
         "shop_name": shop_info.get("name", shop_key),
         "shop_key": shop_key,
-        "token_preview": access_token[:20] + "..." if len(access_token) > 20 else access_token,
+        "token_preview": access_token[:20] + "...",
         "api_version": req.api_version,
-        "message": f"Successfully connected to {shop}! Token will auto-refresh."
+        "message": f"Successfully connected to {shop_info.get('name', shop)}!",
     }
 
 
-@router.get("/api/auth/stores")
+@router.get("/stores")
 async def list_stores():
-    """List all connected stores (without exposing tokens)."""
     stores = load_stores()
     active_key = get_active_store_key()
-    safe = []
-    for key, s in stores.items():
-        safe.append({
-            "shop_key": key,
-            "shop": s.get("shop"),
-            "shop_name": s.get("shop_name"),
-            "api_version": s.get("api_version"),
-            "connected_at": s.get("connected_at"),
-            "is_active": key == active_key,
-        })
-    return {"stores": safe, "count": len(safe), "active_store": active_key}
+    return {
+        "stores": [
+            {
+                "shop_key": k,
+                "shop": s.get("shop"),
+                "shop_name": s.get("shop_name"),
+                "api_version": s.get("api_version"),
+                "connected_at": s.get("connected_at"),
+                "email": s.get("email", ""),
+                "currency": s.get("currency", ""),
+                "is_active": k == active_key,
+            }
+            for k, s in stores.items()
+        ],
+        "count": len(stores),
+        "active_store": active_key,
+    }
 
 
-@router.get("/api/auth/active-store")
+@router.get("/active-store")
 async def get_active_store():
-    """Get the currently active store."""
     active_key = get_active_store_key()
     if not active_key:
         raise HTTPException(status_code=404, detail="No store connected")
@@ -165,32 +177,28 @@ async def get_active_store():
     }
 
 
-@router.post("/api/auth/active-store/{shop_key}")
+@router.post("/active-store/{shop_key}")
 async def set_active_store(shop_key: str):
-    """Switch the active store."""
     stores = load_stores()
     if shop_key not in stores:
         raise HTTPException(status_code=404, detail="Store not found")
     set_active_store_key(shop_key)
     s = stores[shop_key]
-    logger.info(f"✅ Active store switched to: {shop_key}")
     return {
         "success": True,
         "active_store": shop_key,
         "shop_name": s.get("shop_name"),
-        "message": f"Switched to {s.get('shop_name', shop_key)}"
+        "message": f"Switched to {s.get('shop_name', shop_key)}",
     }
 
 
-@router.delete("/api/auth/stores/{shop_key}")
+@router.delete("/stores/{shop_key}")
 async def disconnect_store(shop_key: str):
-    """Disconnect/remove a store."""
     stores = load_stores()
     if shop_key not in stores:
         raise HTTPException(status_code=404, detail="Store not found")
     del stores[shop_key]
     save_stores(stores)
-    # If this was active, switch to another store if available
     active_key = get_active_store_key()
     if active_key == shop_key:
         remaining = list(stores.keys())
@@ -198,9 +206,8 @@ async def disconnect_store(shop_key: str):
     return {"success": True, "message": f"Store {shop_key} disconnected"}
 
 
-@router.get("/api/auth/stores/{shop_key}/token")
+@router.get("/stores/{shop_key}/token")
 async def get_store_token(shop_key: str):
-    """Get token for a store (internal use only)."""
     stores = load_stores()
     if shop_key not in stores:
         raise HTTPException(status_code=404, detail="Store not found")

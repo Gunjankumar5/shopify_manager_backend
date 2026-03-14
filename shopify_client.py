@@ -4,6 +4,7 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+from typing import Any, Dict, Optional
 
 
 env_path = Path(__file__).parent / ".env"
@@ -56,32 +57,49 @@ def _headers():
 
 
 class ShopifyClient:
-<<<<<<< HEAD
-    def __init__(self):
-        if not SHOP_NAME:
-            raise ValueError("Missing SHOPIFY_SHOP_NAME in .env")
+    def __init__(self, shop_name=None, access_token=None, api_version="2026-01"):
+        """Initialize Shopify client.
+        
+        Args:
+            shop_name: Store name (e.g., 'mystore.myshopify.com' or 'mystore')
+            access_token: Access token for API authentication
+            api_version: Shopify API version (default: 2026-01)
+        """
+        self.shop_name = shop_name or SHOP_NAME
+        self.access_token = access_token
+        self.api_version = api_version
+
+        if not self.shop_name:
+            raise ValueError("Missing shop_name. Provide as parameter or set SHOPIFY_SHOP_NAME in .env")
+
+        if not self.shop_name.endswith(".myshopify.com"):
+            self.shop_name = f"{self.shop_name}.myshopify.com"
 
     # =========================================================
     # GRAPHQL
     # =========================================================
 
-    def graphql(self, query: str, variables: dict = None) -> dict:
+    def graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Execute a Shopify Admin GraphQL query or mutation.
         Returns the contents of the top-level `data` key.
         Raises on HTTP errors and on GraphQL-level errors.
         """
-        url = f"https://{SHOP_NAME}.myshopify.com/admin/api/{API_VERSION}/graphql.json"
+        url = f"{self._get_base_url()}/graphql.json"
 
-        payload = {"query": query}
+        payload: Dict[str, Any] = {"query": query}
         if variables:
             payload["variables"] = variables
 
-        r = requests.post(url, headers=_headers(), json=payload, timeout=60)
+        r = requests.post(url, headers=self._get_headers(), json=payload, timeout=60)
 
-        if r.status_code == 401:
-            _refresh_token()
-            r = requests.post(url, headers=_headers(), json=payload, timeout=60)
+        # If unauthorized and no explicit access_token provided, attempt a token refresh
+        if r.status_code == 401 and not self.access_token:
+            try:
+                _refresh_token()
+                r = requests.post(url, headers=self._get_headers(), json=payload, timeout=60)
+            except Exception:
+                pass
 
         r.raise_for_status()
 
@@ -95,29 +113,9 @@ class ShopifyClient:
     # =========================================================
     # PRODUCTS (REST)
     # =========================================================
-=======
-    def __init__(self, shop_name=None, access_token=None, api_version="2026-01"):
-        """Initialize Shopify client.
-        
-        Args:
-            shop_name: Store name (e.g., 'mystore.myshopify.com' or 'mystore')
-            access_token: Access token for API authentication
-            api_version: Shopify API version (default: 2026-01)
-            
-        If shop_name and access_token are provided, use those (for connected stores).
-        Otherwise, fall back to environment variables.
-        """
-        self.shop_name = shop_name or SHOP_NAME
-        self.access_token = access_token
-        self.api_version = api_version
-        
-        if not self.shop_name:
-            raise ValueError("Missing shop_name. Provide as parameter or set SHOPIFY_SHOP_NAME in .env")
-        
-        # Ensure shop_name is in correct format
-        if not self.shop_name.endswith(".myshopify.com"):
-            self.shop_name = f"{self.shop_name}.myshopify.com"
-    
+    # =========================================================
+    # PRODUCTS (REST)
+    # =========================================================
     def _get_base_url(self):
         """Get the base URL for API calls"""
         return f"https://{self.shop_name}/admin/api/{self.api_version}"
@@ -130,8 +128,6 @@ class ShopifyClient:
             "X-Shopify-Access-Token": token,
             "Content-Type": "application/json",
         }
->>>>>>> fbca71b (eat(connect-store): add Shopify store connection feature)
-
 
     def get_products(self, limit=None, status=None, title=None, fetch_all=False):
         """Fetch products using Shopify cursor pagination.
@@ -438,7 +434,7 @@ class ShopifyClient:
     def get_inventory_levels(self, location_ids=None):
         import logging as _log
 
-        params = {"limit": 250}
+        params: Dict[str, Any] = {"limit": 250}
         if location_ids:
             params["location_ids"] = ",".join(str(x) for x in location_ids) if isinstance(location_ids, list) else str(location_ids)
         else:

@@ -7,7 +7,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
  
 
-def _normalize_title(value: str) -> str:
+def _normalize_title(value: Optional[str]) -> str:
     return (value or "").strip().lower()
 
 @router.get("/")

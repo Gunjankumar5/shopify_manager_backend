@@ -23,6 +23,7 @@ from services.bulk_fetch import BulkFetchService
 from services.sync_bridge import (
     get_queue, pop_queue, remove_queue, run_sync, DONE_SENTINEL
 )
+from .store_utils import get_shopify_client
 
 router = APIRouter()
 
@@ -83,19 +84,22 @@ def start_sync(body: Dict[str, Any]):
     """
     rows     = body.get("rows", [])
     snapshot = body.get("snapshot", {})
+    shop_key = body.get("shop_key")
 
     if not rows:
         raise HTTPException(status_code=400, detail="No rows provided")
 
     session_id = str(uuid.uuid4())
     get_queue(session_id)  # register BEFORE thread starts
+    print(f"[EXCEL_SYNC] start requested session={session_id} rows={len(rows)}")
 
     thread = threading.Thread(
         target=run_sync,
-        args=(session_id, rows, snapshot),
+        args=(session_id, rows, snapshot, shop_key),
         daemon=True,
     )
     thread.start()
+    print(f"[EXCEL_SYNC] worker started session={session_id}")
 
     return {"session_id": session_id, "status": "running"}
 
@@ -105,10 +109,12 @@ def start_sync(body: Dict[str, Any]):
 @router.websocket("/sync/progress")
 async def sync_progress_ws(websocket: WebSocket, session: str = ""):
     await websocket.accept()
+    print(f"[EXCEL_SYNC] ws connected session={session or 'missing'}")
 
     if not session:
         await websocket.send_text(json.dumps({"error": "session param required"}))
         await websocket.close()
+        print("[EXCEL_SYNC] ws rejected reason=missing session")
         return
 
     # Wait up to 10s for queue
@@ -123,6 +129,7 @@ async def sync_progress_ws(websocket: WebSocket, session: str = ""):
     if queue is None:
         await websocket.send_text(json.dumps({"error": "Session not found"}))
         await websocket.close()
+        print(f"[EXCEL_SYNC] ws rejected session={session} reason=Session not found")
         return
 
     try:
@@ -152,11 +159,12 @@ async def sync_progress_ws(websocket: WebSocket, session: str = ""):
             await websocket.send_text(msg)
 
     except WebSocketDisconnect:
-        pass
+        print(f"[EXCEL_SYNC] ws disconnected session={session}")
     except Exception as e:
         print(f"[WS] sync/progress error: {e}")
     finally:
         remove_queue(session)
+        print(f"[EXCEL_SYNC] ws closed session={session}")
         try:
             await websocket.close()
         except Exception:
@@ -167,13 +175,11 @@ async def sync_progress_ws(websocket: WebSocket, session: str = ""):
 
 @router.post("/grid-save", summary="Quick push edits to Shopify via REST")
 def grid_save(payload: Dict[str, Any]):
-    from shopify_client import ShopifyClient
-
     changes: List[Dict] = payload.get("changes", [])
     if not changes:
         raise HTTPException(status_code=400, detail="No changes provided")
 
-    client = ShopifyClient()
+    client = get_shopify_client()
     updated, failed, errors = 0, 0, []
 
     for row in changes:
@@ -200,7 +206,7 @@ def grid_save(payload: Dict[str, Any]):
         if row.get("Tags"):        product_payload["tags"]         = row["Tags"]
         if row.get("Status"):      product_payload["status"]       = row["Status"].lower()
 
-        variant_payload = {"id": int(variant_id)}
+        variant_payload = {"id": str(variant_id)}
         if row.get("Variant Price"):            variant_payload["price"]            = str(row["Variant Price"])
         if row.get("Variant Compare At Price"): variant_payload["compare_at_price"] = str(row["Variant Compare At Price"])
         if row.get("Variant SKU"):              variant_payload["sku"]              = row["Variant SKU"]

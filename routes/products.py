@@ -6,10 +6,6 @@ from .store_utils import get_shopify_client
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-<<<<<<< HEAD
-shopify = ShopifyClient()
-=======
->>>>>>> fbca71b (eat(connect-store): add Shopify store connection feature)
 
 
 # ── IMPORTANT: all fixed-path routes MUST come before /{product_id} ──────────
