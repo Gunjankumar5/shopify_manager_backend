@@ -114,3 +114,14 @@ async def add_products_to_collection(collection_id: int, product_ids: List[int])
     except Exception as e:
         logger.error(f"Error adding products to collection: {e}")
         raise HTTPException(status_code=400, detail=str(e))
+
+@router.put("/{collection_id}/products")
+async def sync_products_in_collection(collection_id: int, product_ids: List[int]):
+    """Sync products in a custom collection"""
+    try:
+        shopify = get_shopify_client()
+        result = shopify.sync_collection_products(collection_id, product_ids)
+        return result
+    except Exception as e:
+        logger.error(f"Error syncing products in collection {collection_id}: {e}")
+        raise HTTPException(status_code=400, detail=str(e))

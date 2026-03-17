@@ -390,31 +390,148 @@ class ShopifyClient:
         # Keep backward-compatible response key expected by frontend.
         return {"custom_collections": custom_collections + smart_collections}
 
-    def get_collection(self, collection_id):
+    def _normalize_collection_response(self, payload, collection_type):
+        key = "smart_collection" if collection_type == "smart" else "custom_collection"
+        collection = payload.get(key, {})
+        if collection:
+            collection["collection_type"] = collection_type
+        return payload
+
+    def _get_collection_products(self, collection_id, limit=250):
         r = self._request(
+            "GET",
+            f"{self._get_base_url()}/products.json",
+            params={
+                "collection_id": collection_id,
+                "limit": limit,
+                "fields": "id,title,status,images",
+            },
+        )
+        r.raise_for_status()
+        products = r.json().get("products", [])
+        return [
+            {
+                "id": product.get("id"),
+                "title": product.get("title"),
+                "status": product.get("status"),
+                "image": (product.get("images") or [{}])[0].get("src"),
+            }
+            for product in products
+        ]
+
+    def _collection_payload(self, data, collection_type, include_id=None):
+        allowed_keys = {
+            "title",
+            "body_html",
+            "image",
+            "published",
+            "published_at",
+            "published_scope",
+            "sort_order",
+            "template_suffix",
+            "handle",
+        }
+        if collection_type == "smart":
+            allowed_keys.update({"rules", "disjunctive"})
+
+        payload = {key: value for key, value in data.items() if key in allowed_keys}
+        if include_id is not None:
+            payload["id"] = include_id
+        return payload
+
+    def get_collection(self, collection_id):
+        custom = self._request(
             "GET",
             f"{self._get_base_url()}/custom_collections/{collection_id}.json",
         )
-        r.raise_for_status()
-        return r.json()
+        if custom.ok:
+            data = self._normalize_collection_response(custom.json(), "custom")
+            data["products"] = self._get_collection_products(collection_id)
+            return data
+        if custom.status_code != 404:
+            custom.raise_for_status()
+
+        smart = self._request(
+            "GET",
+            f"{self._get_base_url()}/smart_collections/{collection_id}.json",
+        )
+        smart.raise_for_status()
+        data = self._normalize_collection_response(smart.json(), "smart")
+        data["products"] = self._get_collection_products(collection_id)
+        smart_collection = data.get("smart_collection", {})
+        data["rules"] = smart_collection.get("rules", [])
+        data["disjunctive"] = smart_collection.get("disjunctive", False)
+        return data
 
     def create_collection(self, data):
+        collection_type = data.get("collection_type", "custom")
+        endpoint = "smart_collections" if collection_type == "smart" else "custom_collections"
+        key = "smart_collection" if collection_type == "smart" else "custom_collection"
+        payload = self._collection_payload(data, collection_type)
         r = self._request(
             "POST",
-            f"{self._get_base_url()}/custom_collections.json",
-            json={"custom_collection": data},
+            f"{self._get_base_url()}/{endpoint}.json",
+            json={key: payload},
         )
         r.raise_for_status()
-        return r.json()
+        return self._normalize_collection_response(r.json(), collection_type)
+
+    def _convert_collection(self, collection_id, current_type, target_type, data):
+        existing = self.get_collection(collection_id)
+        existing_collection = existing.get(
+            "smart_collection" if current_type == "smart" else "custom_collection",
+            {},
+        )
+        create_payload = {
+            **existing_collection,
+            **data,
+            "collection_type": target_type,
+        }
+        create_payload.pop("id", None)
+        create_payload.pop("admin_graphql_api_id", None)
+        create_payload.pop("updated_at", None)
+        create_payload.pop("products_count", None)
+
+        created = self.create_collection(create_payload)
+
+        if target_type == "custom":
+            new_collection = created.get("custom_collection", {})
+            product_ids = [product.get("id") for product in existing.get("products", []) if product.get("id")]
+            if new_collection.get("id") and product_ids:
+                self.add_products_to_collection(new_collection["id"], product_ids)
+
+        self.delete_collection(collection_id)
+        return created
 
     def update_collection(self, collection_id, data):
-        r = self._request(
+        requested_type = data.get("collection_type")
+        current = self.get_collection(collection_id)
+        current_type = "smart" if current.get("smart_collection") else "custom"
+
+        if requested_type and requested_type != current_type:
+            return self._convert_collection(collection_id, current_type, requested_type, data)
+
+        collection_type = requested_type or current_type
+        endpoint = "smart_collections" if collection_type == "smart" else "custom_collections"
+        key = "smart_collection" if collection_type == "smart" else "custom_collection"
+        payload = self._collection_payload(data, collection_type, include_id=collection_id)
+        custom = self._request(
             "PUT",
-            f"{self._get_base_url()}/custom_collections/{collection_id}.json",
-            json={"custom_collection": {"id": collection_id, **data}},
+            f"{self._get_base_url()}/{endpoint}/{collection_id}.json",
+            json={key: payload},
         )
-        r.raise_for_status()
-        return r.json()
+        if custom.ok:
+            return self._normalize_collection_response(custom.json(), collection_type)
+        if custom.status_code != 404:
+            custom.raise_for_status()
+
+        smart = self._request(
+            "PUT",
+            f"{self._get_base_url()}/smart_collections/{collection_id}.json",
+            json={"smart_collection": self._collection_payload(data, "smart", include_id=collection_id)},
+        )
+        smart.raise_for_status()
+        return self._normalize_collection_response(smart.json(), "smart")
 
     def add_products_to_collection(self, collection_id, product_ids):
         collects = []
@@ -427,6 +544,30 @@ class ShopifyClient:
             r.raise_for_status()
             collects.append(r.json().get("collect"))
         return {"collects": collects}
+
+    def sync_collection_products(self, collection_id, product_ids):
+        target_ids = {int(product_id) for product_id in product_ids if product_id not in (None, "")}
+        existing_collects = self.get_collects(collection_id=collection_id).get("collects", [])
+        existing_by_product = {
+            int(collect["product_id"]): collect
+            for collect in existing_collects
+            if collect.get("product_id")
+        }
+
+        for product_id, collect in existing_by_product.items():
+            if product_id not in target_ids:
+                self.delete_collect(collect["id"])
+
+        for product_id in sorted(target_ids):
+            if product_id in existing_by_product:
+                continue
+            self._request(
+                "POST",
+                f"{self._get_base_url()}/collects.json",
+                json={"collect": {"product_id": product_id, "collection_id": collection_id}},
+            ).raise_for_status()
+
+        return {"product_ids": sorted(target_ids)}
 
     def get_collects(self, product_id=None, collection_id=None, limit=250):
         params = {"limit": limit}
@@ -480,11 +621,20 @@ class ShopifyClient:
         return {"collection_ids": sorted(target_ids)}
 
     def delete_collection(self, collection_id):
-        r = self._request(
+        custom = self._request(
             "DELETE",
             f"{self._get_base_url()}/custom_collections/{collection_id}.json",
         )
-        r.raise_for_status()
+        if custom.ok:
+            return {"deleted": True}
+        if custom.status_code != 404:
+            custom.raise_for_status()
+
+        smart = self._request(
+            "DELETE",
+            f"{self._get_base_url()}/smart_collections/{collection_id}.json",
+        )
+        smart.raise_for_status()
         return {"deleted": True}
 
     def create_custom_collection(self, title, image_url=None, product_ids=None):
