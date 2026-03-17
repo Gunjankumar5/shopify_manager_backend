@@ -1,63 +1,10 @@
-import os
 import time
-from pathlib import Path
-
 import requests
-from dotenv import load_dotenv
-from typing import Any, Dict, Optional
-
-
-env_path = Path(__file__).parent / ".env"
-load_dotenv(dotenv_path=env_path, override=True)
-
-SHOP_NAME = os.getenv("SHOPIFY_SHOP_NAME")
-API_KEY = os.getenv("SHOPIFY_API_KEY")
-CLIENT_SECRET = os.getenv("SHOPIFY_CLIENT_SECRET")
-API_VERSION = os.getenv("SHOPIFY_API_VERSION") or "2026-01"
-
-_cache = {
-    "token": os.getenv("SHOPIFY_API_PASSWORD"),
-    "expires_at": time.time() + 3600,
-}
-
-
-def _refresh_token():
-    """Fetch a new access token using client credentials when available."""
-    try:
-        r = requests.post(
-            f"https://{SHOP_NAME}.myshopify.com/admin/oauth/access_token",
-            data={
-                "client_id": API_KEY,
-                "client_secret": CLIENT_SECRET,
-                "grant_type": "client_credentials",
-            },
-            timeout=10,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            _cache["token"] = data["access_token"]
-            _cache["expires_at"] = time.time() + data.get("expires_in", 86400)
-            return _cache["token"]
-    except Exception:
-        pass
-    return _cache["token"]
-
-
-def _get_token():
-    if time.time() >= _cache["expires_at"] - 300:
-        return _refresh_token()
-    return _cache["token"]
-
-
-def _headers():
-    return {
-        "X-Shopify-Access-Token": _get_token(),
-        "Content-Type": "application/json",
-    }
+from typing import Any, Callable, Dict, Optional
 
 
 class ShopifyClient:
-    def __init__(self, shop_name=None, access_token=None, api_version="2026-01"):
+    def __init__(self, shop_name=None, access_token=None, api_version="2026-01", token_refresh_callback: Optional[Callable[[], Optional[str]]] = None):
         """Initialize Shopify client.
         
         Args:
@@ -65,15 +12,43 @@ class ShopifyClient:
             access_token: Access token for API authentication
             api_version: Shopify API version (default: 2026-01)
         """
-        self.shop_name = shop_name or SHOP_NAME
+        self.shop_name = shop_name
         self.access_token = access_token
         self.api_version = api_version
+        self.token_refresh_callback = token_refresh_callback
 
         if not self.shop_name:
-            raise ValueError("Missing shop_name. Provide as parameter or set SHOPIFY_SHOP_NAME in .env")
+            raise ValueError("Missing shop_name. Connect a Shopify store before creating the client.")
+
+        if not self.access_token:
+            raise ValueError("Missing access token. Reconnect the Shopify store and try again.")
 
         if not self.shop_name.endswith(".myshopify.com"):
             self.shop_name = f"{self.shop_name}.myshopify.com"
+
+    def _refresh_access_token(self) -> bool:
+        if not self.token_refresh_callback:
+            return False
+        try:
+            refreshed_token = self.token_refresh_callback()
+        except Exception:
+            return False
+        if not refreshed_token:
+            return False
+        self.access_token = refreshed_token
+        return True
+
+    def _request(self, method: str, url: str, retry_on_unauthorized: bool = True, **kwargs):
+        headers = {
+            "Content-Type": "application/json",
+            "X-Shopify-Access-Token": self.access_token,
+            **(kwargs.pop("headers", {}) or {}),
+        }
+        response = requests.request(method, url, headers=headers, **kwargs)
+        if response.status_code == 401 and retry_on_unauthorized and self._refresh_access_token():
+            headers["X-Shopify-Access-Token"] = self.access_token
+            response = requests.request(method, url, headers=headers, **kwargs)
+        return response
 
     # =========================================================
     # GRAPHQL
@@ -91,15 +66,7 @@ class ShopifyClient:
         if variables:
             payload["variables"] = variables
 
-        r = requests.post(url, headers=self._get_headers(), json=payload, timeout=60)
-
-        # If unauthorized and no explicit access_token provided, attempt a token refresh
-        if r.status_code == 401 and not self.access_token:
-            try:
-                _refresh_token()
-                r = requests.post(url, headers=self._get_headers(), json=payload, timeout=60)
-            except Exception:
-                pass
+        r = self._request("POST", url, json=payload, timeout=60)
 
         r.raise_for_status()
 
@@ -119,15 +86,6 @@ class ShopifyClient:
     def _get_base_url(self):
         """Get the base URL for API calls"""
         return f"https://{self.shop_name}/admin/api/{self.api_version}"
-    
-    def _get_headers(self):
-        """Get headers for API requests"""
-        # Use provided token, otherwise fall back to env token
-        token = self.access_token or _get_token()
-        return {
-            "X-Shopify-Access-Token": token,
-            "Content-Type": "application/json",
-        }
 
     def get_products(self, limit=None, status=None, title=None, fetch_all=False):
         """Fetch products using Shopify cursor pagination.
@@ -164,9 +122,9 @@ class ShopifyClient:
 
                 retries = 0
                 while True:
-                    r = requests.get(
+                    r = self._request(
+                        "GET",
                         next_url,
-                        headers=self._get_headers(),
                         params=params if page_num == 1 else None,
                         timeout=20,
                     )
@@ -174,10 +132,6 @@ class ShopifyClient:
                         wait = float(r.headers.get("Retry-After", 2))
                         _log.warning(f"[ShopifyClient] 429 rate limited — waiting {wait}s (retry {retries+1})")
                         time.sleep(wait)
-                        retries += 1
-                        continue
-                    if r.status_code == 401 and retries == 0:
-                        _log.warning("[ShopifyClient] 401 — retrying once with fresh headers")
                         retries += 1
                         continue
                     break
@@ -216,53 +170,53 @@ class ShopifyClient:
             return {"products": all_products}
 
     def search_products(self, query):
-        r = requests.get(
+        r = self._request(
+            "GET",
             f"{self._get_base_url()}/products.json",
-            headers=self._get_headers(),
             params={"title": query},
         )
         r.raise_for_status()
         return r.json().get("products", [])
 
     def get_product(self, product_id):
-        r = requests.get(f"{self._get_base_url()}/products/{product_id}.json", headers=self._get_headers())
+        r = self._request("GET", f"{self._get_base_url()}/products/{product_id}.json")
         r.raise_for_status()
         return r.json()
 
     def create_product(self, data):
-        r = requests.post(
+        r = self._request(
+            "POST",
             f"{self._get_base_url()}/products.json",
-            headers=self._get_headers(),
             json={"product": data},
         )
         r.raise_for_status()
         return r.json()
 
     def update_product(self, product_id, data):
-        r = requests.put(
+        r = self._request(
+            "PUT",
             f"{self._get_base_url()}/products/{product_id}.json",
-            headers=self._get_headers(),
             json={"product": data},
         )
         r.raise_for_status()
         return r.json()
 
     def delete_product(self, product_id):
-        r = requests.delete(f"{self._get_base_url()}/products/{product_id}.json", headers=self._get_headers())
+        r = self._request("DELETE", f"{self._get_base_url()}/products/{product_id}.json")
         r.raise_for_status()
         return {"deleted": True}
 
     def update_product_variant(self, product_id, variant_id, data):
-        r = requests.put(
+        r = self._request(
+            "PUT",
             f"{self._get_base_url()}/variants/{variant_id}.json",
-            headers=self._get_headers(),
             json={"variant": data},
         )
         r.raise_for_status()
         return r.json()
 
     def count_products(self):
-        r = requests.get(f"{self._get_base_url()}/products/count.json", headers=self._get_headers())
+        r = self._request("GET", f"{self._get_base_url()}/products/count.json")
         r.raise_for_status()
         return r.json()
 
@@ -271,25 +225,25 @@ class ShopifyClient:
     # =========================================================
 
     def get_custom_collections(self, limit=50):
-        r = requests.get(
+        r = self._request(
+            "GET",
             f"{self._get_base_url()}/custom_collections.json",
-            headers=self._get_headers(),
             params={"limit": limit},
         )
         r.raise_for_status()
         return r.json()
 
     def get_collections(self, limit=50):
-        custom = requests.get(
+        custom = self._request(
+            "GET",
             f"{self._get_base_url()}/custom_collections.json",
-            headers=self._get_headers(),
             params={"limit": limit},
         )
         custom.raise_for_status()
 
-        smart = requests.get(
+        smart = self._request(
+            "GET",
             f"{self._get_base_url()}/smart_collections.json",
-            headers=self._get_headers(),
             params={"limit": limit},
         )
         smart.raise_for_status()
@@ -306,26 +260,26 @@ class ShopifyClient:
         return {"custom_collections": custom_collections + smart_collections}
 
     def get_collection(self, collection_id):
-        r = requests.get(
+        r = self._request(
+            "GET",
             f"{self._get_base_url()}/custom_collections/{collection_id}.json",
-            headers=self._get_headers(),
         )
         r.raise_for_status()
         return r.json()
 
     def create_collection(self, data):
-        r = requests.post(
+        r = self._request(
+            "POST",
             f"{self._get_base_url()}/custom_collections.json",
-            headers=self._get_headers(),
             json={"custom_collection": data},
         )
         r.raise_for_status()
         return r.json()
 
     def update_collection(self, collection_id, data):
-        r = requests.put(
+        r = self._request(
+            "PUT",
             f"{self._get_base_url()}/custom_collections/{collection_id}.json",
-            headers=self._get_headers(),
             json={"custom_collection": {"id": collection_id, **data}},
         )
         r.raise_for_status()
@@ -334,9 +288,9 @@ class ShopifyClient:
     def add_products_to_collection(self, collection_id, product_ids):
         collects = []
         for product_id in product_ids:
-            r = requests.post(
+            r = self._request(
+                "POST",
                 f"{self._get_base_url()}/collects.json",
-                headers=self._get_headers(),
                 json={"collect": {"product_id": product_id, "collection_id": collection_id}},
             )
             r.raise_for_status()
@@ -344,9 +298,9 @@ class ShopifyClient:
         return {"collects": collects}
 
     def delete_collection(self, collection_id):
-        r = requests.delete(
+        r = self._request(
+            "DELETE",
             f"{self._get_base_url()}/custom_collections/{collection_id}.json",
-            headers=self._get_headers(),
         )
         r.raise_for_status()
         return {"deleted": True}
@@ -356,16 +310,16 @@ class ShopifyClient:
         if image_url:
             data["custom_collection"]["image"] = {"src": image_url}
 
-        r = requests.post(f"{self._get_base_url()}/custom_collections.json", headers=self._get_headers(), json=data)
+        r = self._request("POST", f"{self._get_base_url()}/custom_collections.json", json=data)
         r.raise_for_status()
         result = r.json()
 
         if product_ids and result.get("custom_collection"):
             col_id = result["custom_collection"]["id"]
             for pid in product_ids:
-                requests.post(
+                self._request(
+                    "POST",
                     f"{self._get_base_url()}/collects.json",
-                    headers=self._get_headers(),
                     json={"collect": {"product_id": pid, "collection_id": col_id}},
                 )
         return result
@@ -375,7 +329,7 @@ class ShopifyClient:
     # =========================================================
 
     def get_locations(self):
-        r = requests.get(f"{self._get_base_url()}/locations.json", headers=self._get_headers())
+        r = self._request("GET", f"{self._get_base_url()}/locations.json")
         r.raise_for_status()
         return r.json()
 
@@ -397,9 +351,9 @@ class ShopifyClient:
         try:
             while next_url:
                 page += 1
-                r = requests.get(
+                r = self._request(
+                    "GET",
                     next_url,
-                    headers=self._get_headers(),
                     params=params if page == 1 else None,
                     timeout=20,
                 )
@@ -455,19 +409,12 @@ class ShopifyClient:
 
         while next_url:
             try:
-                r = requests.get(
+                r = self._request(
+                    "GET",
                     next_url,
-                    headers=self._get_headers(),
                     params=params if first else None,
                     timeout=20,
                 )
-                if r.status_code == 401:
-                    r = requests.get(
-                        next_url,
-                        headers=self._get_headers(),
-                        params=params if first else None,
-                        timeout=20,
-                    )
                 r.raise_for_status()
             except requests.HTTPError:
                 # Fallback: derive inventory from variant data already in index
@@ -485,7 +432,7 @@ class ShopifyClient:
                     pg = 0
                     while next_p:
                         pg += 1
-                        rp = requests.get(next_p, headers=self._get_headers(), params=p1 if pg == 1 else None, timeout=20)
+                        rp = self._request("GET", next_p, params=p1 if pg == 1 else None, timeout=20)
                         rp.raise_for_status()
                         for prod in rp.json().get("products", []):
                             for v in prod.get("variants", []):
@@ -507,9 +454,9 @@ class ShopifyClient:
         return {"inventory_levels": self._enrich_inventory_levels(all_levels, variant_index)}
 
     def update_inventory(self, inventory_item_id, location_id, available):
-        r = requests.post(
+        r = self._request(
+            "POST",
             f"{self._get_base_url()}/inventory_levels/set.json",
-            headers=self._get_headers(),
             json={
                 "location_id": location_id,
                 "inventory_item_id": inventory_item_id,

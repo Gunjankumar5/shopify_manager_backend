@@ -3,8 +3,9 @@ from typing import List
 import pandas as pd
 import io
 import sys, os
+import requests as _requests
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from shopify_client import ShopifyClient
+from .store_utils import get_shopify_client
 
 router = APIRouter()
 
@@ -12,10 +13,19 @@ def get_existing_products():
     """Fetch ALL existing products from Shopify to check for duplicates"""
     existing = {"titles": set(), "skus": set(), "handles": set()}
     try:
-        client = ShopifyClient()
-        
+        client = get_shopify_client()
+
         try:
-            result = client.get_products(fetch_all=True)
+            try:
+                result = client.get_products(fetch_all=True)
+            except _requests.exceptions.HTTPError as http_err:
+                # Token expired mid-fetch — refresh and retry
+                if http_err.response is not None and http_err.response.status_code == 401:
+                    print("🔄 Token expired while fetching existing products, refreshing...")
+                    client = get_shopify_client()
+                    result = client.get_products(fetch_all=True)
+                else:
+                    raise
             products = result.get("products", [])
 
             for product in products:
@@ -143,7 +153,7 @@ async def validate_products(products: List[dict]):
 @router.post("/push-to-shopify")
 async def push_to_shopify(products: List[dict]):
     try:
-        client = ShopifyClient()
+        client = get_shopify_client()
         results = {
             "success": [],
             "errors": [],
@@ -221,7 +231,16 @@ async def push_to_shopify(products: List[dict]):
                     del product_data["images"]
 
                 print(f"🚀 Creating: {product_data.get('title')}")
-                r = client.create_product(product_data)
+                try:
+                    r = client.create_product(product_data)
+                except _requests.exceptions.HTTPError as http_err:
+                    # On 401 (token expired mid-upload), refresh the client and retry once
+                    if http_err.response is not None and http_err.response.status_code == 401:
+                        print(f"🔄 Token expired mid-upload, refreshing...")
+                        client = get_shopify_client()
+                        r = client.create_product(product_data)
+                    else:
+                        raise
                 results["success"].append({
                     "title": product_data.get("title"),
                     "id": r.get("product", {}).get("id")

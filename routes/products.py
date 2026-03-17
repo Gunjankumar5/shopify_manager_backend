@@ -304,9 +304,9 @@ async def fetch_all_products(status: str = Query("any")):
             try:
                 retries = 0
                 while True:
-                    r = _req.get(
+                    r = shopify._request(
+                        "GET",
                         next_url,
-                        headers=shopify._get_headers(),
                         params=params if page_num == 1 else None,
                         timeout=25,
                     )

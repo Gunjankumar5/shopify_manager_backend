@@ -51,12 +51,11 @@ pip install -r requirements.txt
 3. Create a `.env` file in the project root (or copy from `.env.example`) and add:
 
 ```env
-SHOPIFY_SHOP_NAME=your-shop-name
-SHOPIFY_API_KEY=your-api-key
-SHOPIFY_CLIENT_SECRET=your-client-secret
-SHOPIFY_API_PASSWORD=your-access-token
-SHOPIFY_API_VERSION=2026-01
+BACKEND_PORT=8000
+FRONTEND_URL=http://localhost:3000
 ```
+
+Shopify credentials are no longer read from `.env` during normal app runtime. The backend uses the connected store saved by the OAuth flow and refreshes its access token from the stored app credentials.
 
 ## Run the Server
 

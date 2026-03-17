@@ -13,8 +13,7 @@ import threading
 import traceback
 from queue import Queue
 
-from shopify_client import ShopifyClient
-from routes.store_utils import load_stores, get_active_store_key, get_connected_store
+from routes.store_utils import get_shopify_client
 
 # ─── Sentinel ────────────────────────────────────────────────────────────────
 DONE_SENTINEL = "__SYNC_DONE__"
@@ -116,31 +115,9 @@ def _diff_row(row: dict, snapshot: dict) -> tuple[dict, dict]:
 
 # ─── Main sync worker (runs in thread) ───────────────────────────────────────
 
-def _resolve_store_client(shop_key: str | None = None) -> ShopifyClient:
-    """Resolve Shopify client from selected/active connected store credentials."""
-    store = None
-
-    if shop_key:
-        stores = load_stores()
-        store = stores.get(shop_key)
-
-    if not store:
-        # Fallback to currently active connected store
-        store = get_connected_store()
-
-    if store:
-        shop_name = store.get("shop") or store.get("shop_name")
-        access_token = store.get("access_token")
-        api_version = store.get("api_version", "2026-01")
-        if shop_name and access_token:
-            return ShopifyClient(
-                shop_name=shop_name,
-                access_token=access_token,
-                api_version=api_version,
-            )
-
-    # Last fallback for backward compatibility (env-based client)
-    return ShopifyClient()
+def _resolve_store_client(shop_key: str | None = None):
+    """Resolve Shopify client from selected or active connected store credentials."""
+    return get_shopify_client(shop_key)
 
 
 def run_sync(session_id: str, rows: list[dict], snapshot: dict, shop_key: str | None = None):

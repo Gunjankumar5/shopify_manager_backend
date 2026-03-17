@@ -15,26 +15,13 @@ try:
 except Exception:
   _orjson = None
 
-from shopify_client import ShopifyClient
-# Prefer using the active connected store's credentials when available
-try:
-  from routes.store_utils import get_shopify_client
-except Exception:
-  get_shopify_client = None
+from routes.store_utils import get_shopify_client
 
 
 class BulkFetchService:
 
     def __init__(self):
-      # Initialise client using active connected store if possible.
-      if get_shopify_client:
-        try:
-          self.client = get_shopify_client()
-        except Exception:
-          # Fallback to env-configured ShopifyClient
-          self.client = ShopifyClient()
-      else:
-        self.client = ShopifyClient()
+      self.client = get_shopify_client()
 
     # =========================================================
     # FULL SYNC

@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 DATA_DIR         = Path(__file__).parent.parent / "data"
 STORES_FILE      = DATA_DIR / "stores.json"
 ACTIVE_STORE_FILE = DATA_DIR / "active_store.json"
+TOKEN_REFRESH_WINDOW_SECONDS = 300
 
 
 # ── File I/O ──────────────────────────────────────────────────────────────────
@@ -63,54 +64,72 @@ def set_active_store_key(shop_key: str | None):
 
 # ── Store + client helpers ────────────────────────────────────────────────────
 
-def get_connected_store() -> dict | None:
-    """Return the active store dict, auto-refreshing the token if it's about to expire."""
+def _refresh_store_token(stores: dict, store_key: str, store: dict) -> dict:
+    logger.info(f"Token refresh requested for {store_key}")
+    try:
+        r = requests.post(
+            f"https://{store['shop']}/admin/oauth/access_token",
+            data={
+                "client_id": store.get("api_key"),
+                "client_secret": store.get("api_secret"),
+                "grant_type": "client_credentials",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        token_data = r.json()
+        store["access_token"] = token_data.get("access_token")
+        store["token_expires_at"] = time.time() + token_data.get("expires_in", 3600)
+        stores[store_key] = store
+        save_stores(stores)
+        logger.info(f"Token refreshed for {store_key}")
+    except Exception as e:
+        logger.warning(f"Token refresh failed for {store_key}: {e}")
+    return store
+
+
+def _get_store_record(shop_key: str | None = None, force_refresh: bool = False) -> tuple[str | None, dict | None]:
     try:
         stores = load_stores()
         if not stores:
-            return None
+            return None, None
 
-        store_key = get_active_store_key()
-        if not store_key or store_key not in stores:
-            return None
+        resolved_key = shop_key or get_active_store_key()
+        if not resolved_key or resolved_key not in stores:
+            return None, None
 
-        store = stores[store_key]
-
-        # Refresh token if expiring within 5 minutes
+        store = stores[resolved_key]
         token_expires_at = store.get("token_expires_at", 0)
-        if token_expires_at and time.time() > token_expires_at - 300:
-            logger.info(f"Token expiring soon for {store_key}, refreshing...")
-            try:
-                r = requests.post(
-                    f"https://{store['shop']}/admin/oauth/access_token",
-                    data={
-                        "client_id":     store.get("api_key"),
-                        "client_secret": store.get("api_secret"),
-                        "grant_type":    "client_credentials",
-                    },
-                    timeout=10,
-                )
-                if r.status_code == 200:
-                    token_data = r.json()
-                    store["access_token"]    = token_data.get("access_token")
-                    store["token_expires_at"] = time.time() + token_data.get("expires_in", 3600)
-                    stores[store_key] = store
-                    save_stores(stores)
-                    logger.info(f"Token refreshed for {store_key}")
-            except Exception as e:
-                logger.warning(f"Token refresh failed: {e}, using existing token")
+        should_refresh = force_refresh or (
+            token_expires_at and time.time() > token_expires_at - TOKEN_REFRESH_WINDOW_SECONDS
+        )
 
-        return stores[store_key]
+        if should_refresh:
+            store = _refresh_store_token(stores, resolved_key, store)
+
+        return resolved_key, store
     except Exception as e:
         logger.error(f"Error loading store: {e}")
+        return None, None
+
+def get_connected_store() -> dict | None:
+    """Return the active store dict, auto-refreshing the token if it's about to expire."""
+    _, store = _get_store_record()
+    return store
+
+
+def get_store_access_token(shop_key: str | None = None, force_refresh: bool = False) -> str | None:
+    _, store = _get_store_record(shop_key=shop_key, force_refresh=force_refresh)
+    if not store:
         return None
+    return store.get("access_token")
 
 
-def get_shopify_client():
-    """Return a ShopifyClient initialised with the active store's credentials."""
+def get_shopify_client(shop_key: str | None = None):
+    """Return a ShopifyClient initialised with the selected store's credentials."""
     from shopify_client import ShopifyClient
 
-    store = get_connected_store()
+    resolved_key, store = _get_store_record(shop_key=shop_key)
     if not store:
         raise HTTPException(
             status_code=400,
@@ -128,7 +147,12 @@ def get_shopify_client():
         )
 
     try:
-        return ShopifyClient(shop_name=shop_name, access_token=access_token, api_version=api_version)
+        return ShopifyClient(
+            shop_name=shop_name,
+            access_token=access_token,
+            api_version=api_version,
+            token_refresh_callback=lambda: get_store_access_token(resolved_key, force_refresh=True),
+        )
     except Exception as e:
         logger.error(f"Error initialising ShopifyClient: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to initialise Shopify client: {str(e)}")
