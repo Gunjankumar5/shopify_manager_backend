@@ -29,6 +29,31 @@ def _clean_str(v: Any) -> Optional[str]:
     return s if s else None
 
 
+def _clean_number_str(v: Any) -> Optional[str]:
+    if v in (None, ""):
+        return None
+    try:
+        return str(float(v)).rstrip("0").rstrip(".") if "." in str(float(v)) else str(int(float(v)))
+    except Exception:
+        s = _clean_str(v)
+        return s
+
+
+def _normalize_collection_ids(value: Any) -> List[int]:
+    raw_values = value if isinstance(value, list) else [value]
+    collection_ids: List[int] = []
+    for item in raw_values:
+        if item in (None, ""):
+            continue
+        if isinstance(item, dict):
+            item = item.get("id") or item.get("value")
+        try:
+            collection_ids.append(int(item))
+        except Exception:
+            continue
+    return sorted(set(collection_ids))
+
+
 def _normalize_images(raw_images: Any) -> List[Dict[str, Any]]:
     if not isinstance(raw_images, list):
         return []
@@ -195,6 +220,10 @@ def normalize_product_payload(product_data: Dict[str, Any], is_update: bool = Fa
         clean["body_html"] = payload.get("description")
     if "productType" in payload and "product_type" not in clean:
         clean["product_type"] = payload.get("productType")
+    if "seo" in payload and isinstance(payload.get("seo"), dict):
+        seo = payload["seo"]
+        if "handle" in seo and "handle" not in clean:
+            clean["handle"] = seo.get("handle")
 
     # Clean string-ish fields
     for k in ["title", "vendor", "product_type", "handle", "body_html", "template_suffix"]:
@@ -223,15 +252,105 @@ def normalize_product_payload(product_data: Dict[str, Any], is_update: bool = Fa
     if variants:
         clean["variants"] = variants
 
-    # Tolerate extra AddProductPage-only fields by accepting and dropping them silently.
+    # Tolerate extra AddProductPage-only fields by accepting and dropping them silently here.
     _ = payload.get("costPerItem")
     _ = payload.get("collections")
     _ = payload.get("seo")
+    _ = payload.get("chargeTax")
 
     if is_update:
         clean.pop("title", None) if clean.get("title") == "" else None
 
     return clean
+
+
+def _extract_variant_cost(payload: Dict[str, Any]) -> Optional[str]:
+    top_level_cost = _clean_number_str(payload.get("costPerItem") or payload.get("cost_per_item"))
+    if top_level_cost is not None:
+        return top_level_cost
+
+    variants = payload.get("variants") if isinstance(payload.get("variants"), list) else []
+    for variant in variants:
+        if not isinstance(variant, dict):
+            continue
+        cost = _clean_number_str(variant.get("costPerItem") or variant.get("cost") or variant.get("unit_cost"))
+        if cost is not None:
+            return cost
+    return None
+
+
+def _extract_seo_payload(payload: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    seo = payload.get("seo") if isinstance(payload.get("seo"), dict) else {}
+    seo_title = None
+    seo_description = None
+
+    if isinstance(seo, dict) and "title" in seo:
+        seo_title = "" if seo.get("title") is None else str(seo.get("title")).strip()
+    elif "seoTitle" in payload:
+        seo_title = "" if payload.get("seoTitle") is None else str(payload.get("seoTitle")).strip()
+
+    if isinstance(seo, dict) and "description" in seo:
+        seo_description = "" if seo.get("description") is None else str(seo.get("description")).strip()
+    elif "seoDescription" in payload:
+        seo_description = "" if payload.get("seoDescription") is None else str(payload.get("seoDescription")).strip()
+
+    return {
+        "title": seo_title,
+        "description": seo_description,
+        "handle": _clean_str(seo.get("handle") if seo else payload.get("handle")),
+    }
+
+
+def _apply_post_product_updates(shopify, product: Dict[str, Any], product_data: Dict[str, Any]):
+    product_id = product.get("id")
+    if not product_id:
+        return
+
+    seo = _extract_seo_payload(product_data)
+    if seo["title"] is not None or seo["description"] is not None:
+        shopify.set_product_seo(product_id, title=seo["title"], description=seo["description"])
+
+    collection_ids = _normalize_collection_ids(product_data.get("collections"))
+    if "collections" in product_data:
+        shopify.sync_product_collections(product_id, collection_ids)
+
+    cost = _extract_variant_cost(product_data)
+    if cost is not None:
+        variants = product.get("variants") or []
+        if variants:
+            inventory_item_id = variants[0].get("inventory_item_id")
+            if inventory_item_id:
+                shopify.update_inventory_item(inventory_item_id, {"cost": cost})
+
+
+def _enrich_product_for_editor(shopify, product: Dict[str, Any]) -> Dict[str, Any]:
+    product_id = product.get("id")
+    if not product_id:
+        return product
+
+    enriched = dict(product)
+    try:
+        enriched["collection_ids"] = shopify.get_product_collection_ids(product_id)
+    except Exception:
+        enriched["collection_ids"] = []
+
+    try:
+        enriched["seo"] = shopify.get_product_seo(product_id)
+    except Exception:
+        enriched["seo"] = {"title": "", "description": ""}
+
+    variants = enriched.get("variants") or []
+    if variants:
+        inventory_item_id = variants[0].get("inventory_item_id")
+        if inventory_item_id:
+            try:
+                inventory_item = shopify.get_inventory_item(inventory_item_id).get("inventory_item", {})
+                if inventory_item.get("cost") not in (None, ""):
+                    variants[0]["cost"] = inventory_item.get("cost")
+            except Exception:
+                pass
+
+    return enriched
 
 
 # ── IMPORTANT: all fixed-path routes MUST come before /{product_id} ──────────
@@ -483,7 +602,11 @@ async def bulk_update_products(updates: List[dict]):
 async def get_product(product_id: int):
     try:
         shopify = get_shopify_client()
-        return shopify.get_product(product_id)
+        result = shopify.get_product(product_id)
+        product = result.get("product") if isinstance(result, dict) else None
+        if isinstance(product, dict):
+            result["product"] = _enrich_product_for_editor(shopify, product)
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -497,7 +620,12 @@ async def create_product(product_data: dict):
         if "title" not in normalized:
             raise ValueError("Product title is required")
         shopify = get_shopify_client()
-        return shopify.create_product(normalized)
+        result = shopify.create_product(normalized)
+        product = result.get("product") if isinstance(result, dict) else None
+        if isinstance(product, dict):
+            _apply_post_product_updates(shopify, product, product_data)
+            result["product"] = _enrich_product_for_editor(shopify, product)
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -509,7 +637,15 @@ async def update_product(product_id: int, product_data: dict):
     try:
         normalized = normalize_product_payload(product_data, is_update=True)
         shopify = get_shopify_client()
-        return shopify.update_product(product_id, normalized)
+        result = shopify.update_product(product_id, normalized)
+        product = result.get("product") if isinstance(result, dict) else None
+        if isinstance(product, dict):
+            _apply_post_product_updates(shopify, product, product_data)
+            refreshed = shopify.get_product(product_id)
+            refreshed_product = refreshed.get("product") if isinstance(refreshed, dict) else None
+            if isinstance(refreshed_product, dict):
+                result["product"] = _enrich_product_for_editor(shopify, refreshed_product)
+        return result
     except HTTPException:
         raise
     except Exception as e:

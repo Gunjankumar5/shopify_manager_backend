@@ -183,6 +183,137 @@ class ShopifyClient:
         r.raise_for_status()
         return r.json()
 
+    def get_product_seo(self, product_id):
+        product_gid = f"gid://shopify/Product/{product_id}"
+        data = self.graphql(
+            """
+            query ProductSeo($id: ID!) {
+              product(id: $id) {
+                titleTag: metafield(namespace: \"global\", key: \"title_tag\") {
+                  value
+                }
+                descriptionTag: metafield(namespace: \"global\", key: \"description_tag\") {
+                  value
+                }
+              }
+            }
+            """,
+            {"id": product_gid},
+        )
+        product = data.get("product") or {}
+        return {
+            "title": ((product.get("titleTag") or {}).get("value") or "").strip(),
+            "description": ((product.get("descriptionTag") or {}).get("value") or "").strip(),
+        }
+
+    def set_product_seo(self, product_id, title=None, description=None):
+        product_gid = f"gid://shopify/Product/{product_id}"
+        metafields = []
+        deletions = []
+
+        def prepare_value(value):
+            if value is None:
+                return None
+            return str(value).strip()
+
+        title_value = prepare_value(title)
+        if title is not None:
+            if title_value:
+                metafields.append(
+                    {
+                        "ownerId": product_gid,
+                        "namespace": "global",
+                        "key": "title_tag",
+                        "type": "single_line_text_field",
+                        "value": title_value,
+                    }
+                )
+            else:
+                deletions.append(
+                    {
+                        "ownerId": product_gid,
+                        "namespace": "global",
+                        "key": "title_tag",
+                    }
+                )
+
+        description_value = prepare_value(description)
+        if description is not None:
+            if description_value:
+                metafields.append(
+                    {
+                        "ownerId": product_gid,
+                        "namespace": "global",
+                        "key": "description_tag",
+                        "type": "multi_line_text_field",
+                        "value": description_value,
+                    }
+                )
+            else:
+                deletions.append(
+                    {
+                        "ownerId": product_gid,
+                        "namespace": "global",
+                        "key": "description_tag",
+                    }
+                )
+
+        result = {"metafields": [], "deletedMetafields": []}
+
+        if metafields:
+            data = self.graphql(
+                """
+                mutation SetProductSeo($metafields: [MetafieldsSetInput!]!) {
+                  metafieldsSet(metafields: $metafields) {
+                    metafields {
+                      id
+                      namespace
+                      key
+                      value
+                    }
+                    userErrors {
+                      field
+                      message
+                      code
+                    }
+                  }
+                }
+                """,
+                {"metafields": metafields},
+            )
+            set_result = data.get("metafieldsSet") or {}
+            user_errors = set_result.get("userErrors") or []
+            if user_errors:
+                raise Exception(user_errors)
+            result["metafields"] = set_result.get("metafields") or []
+
+        if deletions:
+            data = self.graphql(
+                """
+                mutation DeleteProductSeo($metafields: [MetafieldIdentifierInput!]!) {
+                  metafieldsDelete(metafields: $metafields) {
+                    deletedMetafields {
+                      key
+                      namespace
+                      ownerId
+                    }
+                    userErrors {
+                      field
+                      message
+                    }
+                  }
+                }
+                """,
+                {"metafields": deletions},
+            )
+            delete_result = data.get("metafieldsDelete") or {}
+            user_errors = delete_result.get("userErrors") or []
+            if user_errors:
+                raise Exception(user_errors)
+            result["deletedMetafields"] = delete_result.get("deletedMetafields") or []
+
+        return result
+
     def create_product(self, data):
         r = self._request(
             "POST",
@@ -296,6 +427,57 @@ class ShopifyClient:
             r.raise_for_status()
             collects.append(r.json().get("collect"))
         return {"collects": collects}
+
+    def get_collects(self, product_id=None, collection_id=None, limit=250):
+        params = {"limit": limit}
+        if product_id is not None:
+            params["product_id"] = product_id
+        if collection_id is not None:
+            params["collection_id"] = collection_id
+
+        r = self._request(
+            "GET",
+            f"{self._get_base_url()}/collects.json",
+            params=params,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def get_product_collection_ids(self, product_id):
+        collects = self.get_collects(product_id=product_id).get("collects", [])
+        return [collect.get("collection_id") for collect in collects if collect.get("collection_id")]
+
+    def delete_collect(self, collect_id):
+        r = self._request(
+            "DELETE",
+            f"{self._get_base_url()}/collects/{collect_id}.json",
+        )
+        r.raise_for_status()
+        return {"deleted": True}
+
+    def sync_product_collections(self, product_id, collection_ids):
+        target_ids = {int(cid) for cid in collection_ids if cid not in (None, "")}
+        existing_collects = self.get_collects(product_id=product_id).get("collects", [])
+        existing_by_collection = {
+            int(collect["collection_id"]): collect
+            for collect in existing_collects
+            if collect.get("collection_id")
+        }
+
+        for collection_id, collect in existing_by_collection.items():
+            if collection_id not in target_ids:
+                self.delete_collect(collect["id"])
+
+        for collection_id in sorted(target_ids):
+            if collection_id in existing_by_collection:
+                continue
+            self._request(
+                "POST",
+                f"{self._get_base_url()}/collects.json",
+                json={"collect": {"product_id": product_id, "collection_id": collection_id}},
+            ).raise_for_status()
+
+        return {"collection_ids": sorted(target_ids)}
 
     def delete_collection(self, collection_id):
         r = self._request(
@@ -462,6 +644,23 @@ class ShopifyClient:
                 "inventory_item_id": inventory_item_id,
                 "available": available,
             },
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def get_inventory_item(self, inventory_item_id):
+        r = self._request(
+            "GET",
+            f"{self._get_base_url()}/inventory_items/{inventory_item_id}.json",
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def update_inventory_item(self, inventory_item_id, data):
+        r = self._request(
+            "PUT",
+            f"{self._get_base_url()}/inventory_items/{inventory_item_id}.json",
+            json={"inventory_item": {"id": inventory_item_id, **data}},
         )
         r.raise_for_status()
         return r.json()
