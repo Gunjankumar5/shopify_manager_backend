@@ -1,10 +1,8 @@
 """
 sync_bridge.py
 
-Self-contained sync engine that compares edited grid rows against the
-snapshot baseline and pushes only the changed fields to Shopify via REST.
-
-Called by the sync WebSocket endpoint. Runs in a daemon thread.
+CRITICAL FIX: Python's ContextVar does NOT propagate across thread boundaries.
+So user_id MUST be passed explicitly from the FastAPI route into this thread.
 """
 
 import json
@@ -13,18 +11,13 @@ import threading
 import traceback
 from queue import Queue
 
-from routes.store_utils import get_shopify_client
-
-# ─── Sentinel ────────────────────────────────────────────────────────────────
 DONE_SENTINEL = "__SYNC_DONE__"
 
-# ─── Per-request progress queues ─────────────────────────────────────────────
 _queues: dict[str, Queue] = {}
 _lock = threading.Lock()
 
 
 def _log(msg: str):
-    """Print sync logs with a consistent prefix for easy terminal filtering."""
     print(f"[EXCEL_SYNC] {msg}")
 
 
@@ -45,44 +38,35 @@ def remove_queue(session_id: str):
         _queues.pop(session_id, None)
 
 
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
 def _numeric_id(gid: str) -> str:
-    """Extract numeric ID from a Shopify GID like 'gid://shopify/Product/123'."""
     return str(gid).split("/")[-1]
 
 
 def _diff_row(row: dict, snapshot: dict) -> tuple[dict, dict]:
-    """
-    Compare a row against snapshot data and return dicts of changed
-    product-level and variant-level fields.
-    """
     product_gid = row.get("Product ID", "")
-    snap_entry = snapshot.get(product_gid)
+    snap_entry  = snapshot.get(product_gid)
     if not snap_entry:
         return {}, {}
 
-    snap_product = snap_entry.get("product", {})
+    snap_product  = snap_entry.get("product", {})
     snap_variants = snap_entry.get("variants", [])
 
-    variant_gid = row.get("Variant ID", "")
+    variant_gid  = row.get("Variant ID", "")
     snap_variant = {}
     for sv in snap_variants:
         if sv.get("id") == variant_gid:
             snap_variant = sv
             break
 
-    # Product-level field mapping: row key → (snapshot key, payload key)
     PRODUCT_FIELDS = {
-        "Title":            ("title",           "title"),
-        "Body (HTML)":      ("descriptionHtml", "body_html"),
-        "Vendor":           ("vendor",          "vendor"),
-        "Type":             ("productType",     "product_type"),
-        "Tags":             ("tags",            "tags"),
-        "Status":           ("status",          "status"),
+        "Title":       ("title",           "title"),
+        "Body (HTML)": ("descriptionHtml", "body_html"),
+        "Vendor":      ("vendor",          "vendor"),
+        "Type":        ("productType",     "product_type"),
+        "Tags":        ("tags",            "tags"),
+        "Status":      ("status",          "status"),
     }
 
-    # Variant-level field mapping: row key → (snapshot key, payload key)
     VARIANT_FIELDS = {
         "Variant Price":            ("price",          "price"),
         "Variant Compare At Price": ("compareAtPrice", "compare_at_price"),
@@ -94,14 +78,10 @@ def _diff_row(row: dict, snapshot: dict) -> tuple[dict, dict]:
     for row_key, (snap_key, api_key) in PRODUCT_FIELDS.items():
         new_val = row.get(row_key, "")
         old_val = snap_product.get(snap_key, "")
-        # Normalize tags (snapshot stores as list, row as comma string)
         if snap_key == "tags" and isinstance(old_val, list):
             old_val = ", ".join(old_val)
         if str(new_val or "") != str(old_val or ""):
-            val = new_val
-            if api_key == "status":
-                val = str(new_val).lower()
-            product_changes[api_key] = val
+            product_changes[api_key] = str(new_val).lower() if api_key == "status" else new_val
 
     variant_changes = {}
     for row_key, (snap_key, api_key) in VARIANT_FIELDS.items():
@@ -113,20 +93,16 @@ def _diff_row(row: dict, snapshot: dict) -> tuple[dict, dict]:
     return product_changes, variant_changes
 
 
-# ─── Main sync worker (runs in thread) ───────────────────────────────────────
-
-def _resolve_store_client(shop_key: str | None = None):
-    """Resolve Shopify client from selected or active connected store credentials."""
-    return get_shopify_client(shop_key)
-
-
-def run_sync(session_id: str, rows: list[dict], snapshot: dict, shop_key: str | None = None):
+def run_sync(
+    session_id: str,
+    rows: list[dict],
+    snapshot: dict,
+    shop_key: str | None = None,
+    user_id: str | None = None,
+):
     """
-    Sync pipeline:
-      1. Compare each row against snapshot to find changes
-      2. Push changed product/variant fields to Shopify REST API
-      3. Stream row-by-row progress via queue
-      4. Push summary + sentinel when done
+    Run sync in a background thread.
+    user_id is passed explicitly because ContextVar does NOT cross thread boundaries.
     """
     queue = pop_queue(session_id)
 
@@ -134,120 +110,82 @@ def run_sync(session_id: str, rows: list[dict], snapshot: dict, shop_key: str | 
         if queue:
             queue.put(json.dumps(msg))
 
-    counts = {"total": 0, "updated": 0, "skipped": 0, "errors": 0}
+    counts     = {"total": 0, "updated": 0, "skipped": 0, "errors": 0}
     start_time = time.time()
-    _log(f"session={session_id} started rows={len(rows)}")
+    _log(f"session={session_id} started rows={len(rows)} user={user_id}")
 
     try:
-        client = _resolve_store_client(shop_key)
+        # ── Set user context inside this thread ───────────────────────────
+        from routes.store_utils import set_request_user_id, get_shopify_client
+        set_request_user_id(user_id)
 
+        if not user_id:
+            _log(f"session={session_id} ERROR: No user_id provided")
+            push({"done": True, "error": "Not authenticated. Please log in.", "auth_error": True})
+            return
+
+        # ── Get Shopify client ────────────────────────────────────────────
+        try:
+            client = get_shopify_client(shop_key=shop_key, user_id=user_id)
+        except Exception as e:
+            _log(f"session={session_id} ERROR: {e}")
+            push({"done": True, "error": str(e), "auth_error": True})
+            return
+
+        # ── Process rows ──────────────────────────────────────────────────
         for idx, row in enumerate(rows):
             counts["total"] += 1
-
             product_gid = row.get("Product ID", "")
             variant_gid = row.get("Variant ID", "")
-            product_id = _numeric_id(product_gid)
-            variant_id = _numeric_id(variant_gid)
+            product_id  = _numeric_id(product_gid)
+            variant_id  = _numeric_id(variant_gid)
 
             if not product_id.isdigit():
-                push({
-                    "row_index": idx,
-                    "variant_id": variant_gid,
-                    "status": "SKIPPED",
-                    "changes": [],
-                    "error": "Missing Product ID",
-                })
+                push({"row_index": idx, "variant_id": variant_gid, "status": "SKIPPED", "changes": [], "error": "Missing Product ID"})
                 counts["skipped"] += 1
-                _log(
-                    f"session={session_id} row={idx + 1}/{len(rows)} status=SKIPPED reason=Missing Product ID"
-                )
                 continue
 
             try:
                 product_changes, variant_changes = _diff_row(row, snapshot)
 
                 if not product_changes and not variant_changes:
-                    push({
-                        "row_index": idx,
-                        "variant_id": variant_gid,
-                        "status": "SKIPPED",
-                        "changes": [],
-                        "error": None,
-                    })
+                    push({"row_index": idx, "variant_id": variant_gid, "status": "SKIPPED", "changes": [], "error": None})
                     counts["skipped"] += 1
-                    _log(
-                        f"session={session_id} row={idx + 1}/{len(rows)} status=SKIPPED reason=No changes"
-                    )
                     continue
 
                 change_list = []
-
                 if product_changes:
                     client.update_product(product_id, product_changes)
                     change_list += list(product_changes.keys())
 
                 if variant_changes and variant_id.isdigit():
-                    client.update_product_variant(
-                        product_id, variant_id, {"id": int(variant_id), **variant_changes}
-                    )
+                    client.update_product_variant(product_id, variant_id, {"id": int(variant_id), **variant_changes})
                     change_list += list(variant_changes.keys())
 
-                push({
-                    "row_index": idx,
-                    "variant_id": variant_gid,
-                    "status": "UPDATED",
-                    "changes": change_list,
-                    "error": None,
-                })
+                push({"row_index": idx, "variant_id": variant_gid, "status": "UPDATED", "changes": change_list, "error": None})
                 counts["updated"] += 1
-                _log(
-                    f"session={session_id} row={idx + 1}/{len(rows)} status=UPDATED changes={','.join(change_list)}"
-                )
+                _log(f"session={session_id} row={idx+1}/{len(rows)} UPDATED changes={','.join(change_list)}")
 
             except Exception as row_err:
-                push({
-                    "row_index": idx,
-                    "variant_id": variant_gid,
-                    "status": "ERROR",
-                    "changes": [],
-                    "error": str(row_err),
-                })
+                push({"row_index": idx, "variant_id": variant_gid, "status": "ERROR", "changes": [], "error": str(row_err), "traceback": traceback.format_exc()})
                 counts["errors"] += 1
-                _log(
-                    f"session={session_id} row={idx + 1}/{len(rows)} status=ERROR error={row_err}"
-                )
+                _log(f"session={session_id} row={idx+1}/{len(rows)} ERROR {row_err}")
 
-        # Summary
         push({
             "done": True,
-            "total":            counts["total"],
-            "updated":          counts["updated"],
-            "created":          0,
-            "skipped":          counts["skipped"],
-            "deleted":          0,
-            "errors":           counts["errors"],
-            "conflicts":        0,
+            "total": counts["total"],
+            "updated": counts["updated"],
+            "created": 0,
+            "skipped": counts["skipped"],
+            "deleted": 0,
+            "errors": counts["errors"],
+            "conflicts": 0,
             "duration_seconds": round(time.time() - start_time, 2),
         })
-        _log(
-            "session={} finished total={} updated={} skipped={} errors={} duration={}s".format(
-                session_id,
-                counts["total"],
-                counts["updated"],
-                counts["skipped"],
-                counts["errors"],
-                round(time.time() - start_time, 2),
-            )
-        )
+        _log(f"session={session_id} finished total={counts['total']} updated={counts['updated']} skipped={counts['skipped']} errors={counts['errors']}")
 
     except Exception as e:
-        err = str(e)
-        push({
-            "done": True,
-            "error": err,
-            "auth_error": "401" in err or "Unauthorized" in err,
-            "traceback": traceback.format_exc(),
-        })
+        push({"done": True, "error": str(e), "auth_error": "401" in str(e), "traceback": traceback.format_exc()})
         _log(f"session={session_id} fatal_error={e}")
 
     finally:

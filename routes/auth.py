@@ -1,12 +1,22 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 import requests
 import time
 import logging
-from .store_utils import load_stores, save_stores, get_active_store_key, set_active_store_key, get_shopify_client
+from .store_utils import load_stores, save_stores, get_active_store_key, set_active_store_key
+from .auth_utils import require_authenticated_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+def _mask_secret(value: str) -> str:
+    token = (value or "").strip()
+    if not token:
+        return ""
+    if len(token) <= 8:
+        return "*" * len(token)
+    return f"{token[:4]}...{token[-4:]}"
 
 
 def generate_access_token(shop: str, api_key: str, api_secret: str, api_version: str = "2026-01"):
@@ -81,7 +91,7 @@ class ConnectRequest(BaseModel):
 # ── Routes — NO /api/auth prefix here; main.py adds prefix="/api/auth" ────────
 
 @router.post("/connect")
-async def connect_store(req: ConnectRequest):
+def connect_store(req: ConnectRequest, user_id: str = Depends(require_authenticated_user)):
     logger.info(f"🔗 Connect request for: {req.shop_name}")
 
     shop = req.shop_name.strip().lower()
@@ -108,7 +118,7 @@ async def connect_store(req: ConnectRequest):
         logger.warning(f"Could not fetch shop info: {e}")
 
     # Save to stores.json
-    stores = load_stores()
+    stores = load_stores(user_id=user_id)
     stores[shop_key] = {
         "shop": shop,
         "shop_name": shop_info.get("name", shop_key),
@@ -121,8 +131,8 @@ async def connect_store(req: ConnectRequest):
         "email": shop_info.get("email", ""),
         "currency": shop_info.get("currency", ""),
     }
-    save_stores(stores)
-    set_active_store_key(shop_key)
+    save_stores(stores, user_id=user_id)
+    set_active_store_key(shop_key, user_id=user_id)
     logger.info(f"✅ Store {shop_key} saved and set as active")
 
     return {
@@ -130,16 +140,16 @@ async def connect_store(req: ConnectRequest):
         "shop": shop,
         "shop_name": shop_info.get("name", shop_key),
         "shop_key": shop_key,
-        "token_preview": access_token[:20] + "...",
+        "token_preview": _mask_secret(access_token),
         "api_version": req.api_version,
         "message": f"Successfully connected to {shop_info.get('name', shop)}!",
     }
 
 
 @router.get("/stores")
-async def list_stores():
-    stores = load_stores()
-    active_key = get_active_store_key()
+def list_stores(user_id: str = Depends(require_authenticated_user)):
+    stores = load_stores(user_id=user_id)
+    active_key = get_active_store_key(user_id=user_id)
     return {
         "stores": [
             {
@@ -160,11 +170,11 @@ async def list_stores():
 
 
 @router.get("/active-store")
-async def get_active_store():
-    active_key = get_active_store_key()
+def get_active_store(user_id: str = Depends(require_authenticated_user)):
+    active_key = get_active_store_key(user_id=user_id)
     if not active_key:
         raise HTTPException(status_code=404, detail="No store connected")
-    stores = load_stores()
+    stores = load_stores(user_id=user_id)
     if active_key not in stores:
         raise HTTPException(status_code=404, detail="Active store not found")
     s = stores[active_key]
@@ -178,11 +188,11 @@ async def get_active_store():
 
 
 @router.post("/active-store/{shop_key}")
-async def set_active_store(shop_key: str):
-    stores = load_stores()
+def set_active_store(shop_key: str, user_id: str = Depends(require_authenticated_user)):
+    stores = load_stores(user_id=user_id)
     if shop_key not in stores:
         raise HTTPException(status_code=404, detail="Store not found")
-    set_active_store_key(shop_key)
+    set_active_store_key(shop_key, user_id=user_id)
     s = stores[shop_key]
     return {
         "success": True,
@@ -193,27 +203,14 @@ async def set_active_store(shop_key: str):
 
 
 @router.delete("/stores/{shop_key}")
-async def disconnect_store(shop_key: str):
-    stores = load_stores()
+def disconnect_store(shop_key: str, user_id: str = Depends(require_authenticated_user)):
+    stores = load_stores(user_id=user_id)
     if shop_key not in stores:
         raise HTTPException(status_code=404, detail="Store not found")
     del stores[shop_key]
-    save_stores(stores)
-    active_key = get_active_store_key()
+    save_stores(stores, user_id=user_id)
+    active_key = get_active_store_key(user_id=user_id)
     if active_key == shop_key:
         remaining = list(stores.keys())
-        set_active_store_key(remaining[0] if remaining else None)
+        set_active_store_key(remaining[0] if remaining else None, user_id=user_id)
     return {"success": True, "message": f"Store {shop_key} disconnected"}
-
-
-@router.get("/stores/{shop_key}/token")
-async def get_store_token(shop_key: str):
-    stores = load_stores()
-    if shop_key not in stores:
-        raise HTTPException(status_code=404, detail="Store not found")
-    s = stores[shop_key]
-    return {
-        "access_token": s.get("access_token"),
-        "shop": s.get("shop"),
-        "api_version": s.get("api_version"),
-    }

@@ -1,3 +1,7 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# FILE 1: routes/export.py  — pass user_id to sync thread
+# ═══════════════════════════════════════════════════════════════════════════════
+
 """
 routes/export.py
 
@@ -16,14 +20,14 @@ import threading
 import uuid
 from typing import Dict, Any, List
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import Response
 
 from services.bulk_fetch import BulkFetchService
 from services.sync_bridge import (
     get_queue, pop_queue, remove_queue, run_sync, DONE_SENTINEL
 )
-from .store_utils import get_shopify_client
+from .store_utils import get_shopify_client, get_request_user_id
 
 router = APIRouter()
 
@@ -50,10 +54,6 @@ def export_excel():
 
 @router.get("/json", summary="Load products as JSON rows + snapshot for sync")
 def export_json():
-    """
-    Returns rows (for grid) AND snapshot (for sync delta detection baseline).
-    Frontend stores the snapshot in memory and sends it back on sync.
-    """
     try:
         service = BulkFetchService()
         rows, snapshot = service.full_sync()
@@ -78,9 +78,8 @@ def export_json():
 @router.post("/sync", status_code=202)
 def start_sync(body: Dict[str, Any]):
     """
-    Body: { "rows": [...], "snapshot": {...} }
+    Body: { "rows": [...], "snapshot": {...}, "shop_key": "..." }
     Returns: { "session_id": "...", "status": "running" }
-    Connect to WS /api/export/sync/progress?session={session_id}
     """
     rows     = body.get("rows", [])
     snapshot = body.get("snapshot", {})
@@ -89,13 +88,16 @@ def start_sync(body: Dict[str, Any]):
     if not rows:
         raise HTTPException(status_code=400, detail="No rows provided")
 
+    # ── Capture user_id from current request context ──────────────────────────
+    user_id = get_request_user_id()
+
     session_id = str(uuid.uuid4())
     get_queue(session_id)  # register BEFORE thread starts
-    print(f"[EXCEL_SYNC] start requested session={session_id} rows={len(rows)}")
+    print(f"[EXCEL_SYNC] start requested session={session_id} rows={len(rows)} user={user_id}")
 
     thread = threading.Thread(
         target=run_sync,
-        args=(session_id, rows, snapshot, shop_key),
+        args=(session_id, rows, snapshot, shop_key, user_id),  # ← pass user_id
         daemon=True,
     )
     thread.start()
@@ -114,7 +116,6 @@ async def sync_progress_ws(websocket: WebSocket, session: str = ""):
     if not session:
         await websocket.send_text(json.dumps({"error": "session param required"}))
         await websocket.close()
-        print("[EXCEL_SYNC] ws rejected reason=missing session")
         return
 
     # Wait up to 10s for queue
@@ -129,7 +130,6 @@ async def sync_progress_ws(websocket: WebSocket, session: str = ""):
     if queue is None:
         await websocket.send_text(json.dumps({"error": "Session not found"}))
         await websocket.close()
-        print(f"[EXCEL_SYNC] ws rejected session={session} reason=Session not found")
         return
 
     try:
@@ -194,7 +194,7 @@ def grid_save(payload: Dict[str, Any]):
             continue
 
         if not product_id.isdigit() or not variant_id.isdigit():
-            errors.append({"row": row.get("Title", "?"), "error": f"Bad IDs"})
+            errors.append({"row": row.get("Title", "?"), "error": "Bad IDs"})
             failed += 1
             continue
 

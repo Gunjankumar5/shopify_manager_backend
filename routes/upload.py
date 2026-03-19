@@ -2,12 +2,15 @@ from fastapi import APIRouter, HTTPException, UploadFile, File
 from typing import List
 import pandas as pd
 import io
+import csv
 import sys, os
 import requests as _requests
+from openpyxl import load_workbook
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from .store_utils import get_shopify_client
 
 router = APIRouter()
+PREVIEW_ROWS = 10
 
 def get_existing_products():
     """Fetch ALL existing products from Shopify to check for duplicates"""
@@ -54,11 +57,36 @@ def get_existing_products():
     return existing
 
 
-def parse_file(content, filename):
+def parse_file(content, filename, preview=False):
     if filename.endswith(".csv"):
+        if preview:
+            return pd.read_csv(io.BytesIO(content), nrows=PREVIEW_ROWS)
         return pd.read_csv(io.BytesIO(content))
     elif filename.endswith((".xlsx", ".xls")):
+        if preview:
+            return pd.read_excel(io.BytesIO(content), nrows=PREVIEW_ROWS)
         return pd.read_excel(io.BytesIO(content))
+    raise ValueError("Unsupported file type. Use .csv, .xlsx or .xls")
+
+
+def estimate_total_rows(content, filename):
+    if filename.endswith(".csv"):
+        reader = csv.reader(io.StringIO(content.decode("utf-8-sig", errors="replace")))
+        line_count = sum(1 for _ in reader)
+        return max(line_count - 1, 0)
+
+    if filename.endswith(".xlsx"):
+        workbook = load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+        try:
+            worksheet = workbook.active
+            return max((worksheet.max_row or 1) - 1, 0)
+        finally:
+            workbook.close()
+
+    # Legacy .xls fallback keeps previous behavior.
+    if filename.endswith(".xls"):
+        return len(pd.read_excel(io.BytesIO(content)))
+
     raise ValueError("Unsupported file type. Use .csv, .xlsx or .xls")
 
 
@@ -66,13 +94,14 @@ def parse_file(content, filename):
 async def preview_file(file: UploadFile = File(...)):
     try:
         content = await file.read()
-        df = parse_file(content, file.filename)
+        total_rows = estimate_total_rows(content, file.filename)
+        df = parse_file(content, file.filename, preview=True)
         df = df.fillna("")
         return {
             "filename": file.filename,
-            "total_rows": len(df),
+            "total_rows": total_rows,
             "columns": list(df.columns),
-            "preview": df.head(10).to_dict(orient="records")
+            "preview": df.head(PREVIEW_ROWS).to_dict(orient="records")
         }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

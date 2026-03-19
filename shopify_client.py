@@ -1,6 +1,8 @@
 import time
 import requests
 from typing import Any, Callable, Dict, Optional
+from urllib.parse import parse_qs, urlparse
+import re
 
 
 class ShopifyClient:
@@ -87,7 +89,23 @@ class ShopifyClient:
         """Get the base URL for API calls"""
         return f"https://{self.shop_name}/admin/api/{self.api_version}"
 
-    def get_products(self, limit=None, status=None, title=None, fetch_all=False):
+    def _extract_next_page_info(self, response: requests.Response) -> Optional[str]:
+        """Extract cursor from Shopify Link header with a robust fallback parser."""
+        next_url = response.links.get("next", {}).get("url")
+        if not next_url:
+            link_header = response.headers.get("Link", "")
+            if link_header:
+                match = re.search(r'<([^>]+)>\s*;\s*rel="next"', link_header)
+                if match:
+                    next_url = match.group(1)
+
+        if not next_url:
+            return None
+
+        parsed = urlparse(next_url)
+        return parse_qs(parsed.query).get("page_info", [None])[0]
+
+    def get_products(self, limit=None, status=None, title=None, fetch_all=False, page_info=None):
         """Fetch products using Shopify cursor pagination.
 
         fetch_all=False  → first page only (250 items, very fast).
@@ -99,17 +117,27 @@ class ShopifyClient:
         page_size = 250  # Shopify hard max per request
         all_products = []
 
+        requested_limit = None
+        try:
+            if limit is not None:
+                requested_limit = max(1, min(int(limit), page_size))
+        except Exception:
+            requested_limit = None
+
         params = {
-            "limit": page_size,
-            "fields": "id,title,vendor,status,handle,image,images,variants",
+            "limit": requested_limit or page_size,
         }
         if status and status != "any":
             params["status"] = status
-        if title:
-            params["title"] = title
+        if page_info:
+            params["page_info"] = page_info
+
+        search_term = (title or "").strip().lower()
+        scan_across_pages = fetch_all or bool(search_term)
 
         next_url = f"{self._get_base_url()}/products.json"
         page_num = 0
+        next_page_info = None
 
         try:
             while next_url:
@@ -138,15 +166,42 @@ class ShopifyClient:
 
                 r.raise_for_status()
                 batch = r.json().get("products", [])
-                all_products.extend(batch)
-                _log.info(f"[ShopifyClient] Page {page_num}: +{len(batch)} → total {len(all_products)}")
+                if search_term:
+                    filtered_batch = []
+                    for product in batch:
+                        p_title = str(product.get("title") or "").lower()
+                        p_vendor = str(product.get("vendor") or "").lower()
+                        p_handle = str(product.get("handle") or "").lower()
+                        if search_term in p_title or search_term in p_vendor or search_term in p_handle:
+                            filtered_batch.append(product)
+                else:
+                    filtered_batch = batch
 
-                # Stop early if last page or fetch_all disabled
-                if not batch or not fetch_all:
+                all_products.extend(filtered_batch)
+                _log.info(
+                    f"[ShopifyClient] Page {page_num}: matched +{len(filtered_batch)} (raw {len(batch)}) → total {len(all_products)}"
+                )
+
+                next_page_info = self._extract_next_page_info(r)
+                next_url = r.links.get("next", {}).get("url")
+                if not next_url and next_page_info:
+                    # When response.links is empty but Link header exists, keep looping via cursor.
+                    next_url = f"{self._get_base_url()}/products.json?page_info={next_page_info}&limit={params['limit']}"
+                    if status and status != "any":
+                        next_url += f"&status={status}"
+                    if title:
+                        next_url += f"&title={title}"
+
+                # Stop early if there are no more source products.
+                if not batch:
+                    break
+
+                # For normal browsing (no search, no fetch_all), only fetch one page.
+                if not scan_across_pages:
                     break
 
                 # Shopify cursor: follow Link: rel="next" header
-                next_url = r.links.get("next", {}).get("url")
+                # next_url already resolved above.
 
                 # Stop if explicit limit reached
                 if limit and len(all_products) >= limit:
@@ -157,17 +212,39 @@ class ShopifyClient:
                 all_products = all_products[:limit]
 
             _log.info(f"[ShopifyClient] ✅ Done: {len(all_products)} products (pages={page_num})")
-            return {"products": all_products}
+            return {
+                "products": all_products,
+                "next_page_info": next_page_info,
+                "has_next_page": bool(next_page_info),
+            }
 
         except requests.exceptions.Timeout:
             _log.error(f"[ShopifyClient] ❌ Timeout after page {page_num} — returning {len(all_products)} so far")
-            return {"products": all_products}
+            return {
+                "products": all_products,
+                "next_page_info": next_page_info,
+                "has_next_page": bool(next_page_info),
+                "partial": True,
+                "error": "Timeout while fetching products from Shopify",
+            }
         except requests.exceptions.HTTPError as e:
             _log.error(f"[ShopifyClient] ❌ HTTP {e.response.status_code}: {e.response.text[:200]}")
-            return {"products": all_products}
+            return {
+                "products": all_products,
+                "next_page_info": next_page_info,
+                "has_next_page": bool(next_page_info),
+                "partial": True,
+                "error": f"Shopify HTTP error {e.response.status_code}",
+            }
         except Exception as e:
             _log.error(f"[ShopifyClient] ❌ Error: {e}")
-            return {"products": all_products}
+            return {
+                "products": all_products,
+                "next_page_info": next_page_info,
+                "has_next_page": bool(next_page_info),
+                "partial": True,
+                "error": str(e),
+            }
 
     def search_products(self, query):
         r = self._request(

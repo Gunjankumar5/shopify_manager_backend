@@ -2,10 +2,73 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from typing import Optional, List, Any, Dict
 import logging, json
-from .store_utils import get_shopify_client
+import time
+from .store_utils import get_shopify_client, get_request_user_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+_PRODUCT_CACHE: Dict[str, tuple[float, Any]] = {}
+
+_READ_ONLY_PRODUCT_KEYS = {
+    "admin_graphql_api_id",
+    "created_at",
+    "updated_at",
+    "published_at",
+    "variant_gids",
+    "image",
+}
+
+_FRONTEND_ONLY_PRODUCT_KEYS = {
+    "costPerItem",
+    "collections",
+    "seo",
+    "chargeTax",
+    "comparePrice",
+    "trackQty",
+    "isPhysical",
+    "qty",
+    "price",
+    "sku",
+    "barcode",
+    "weight",
+    "collection_ids",
+}
+
+_READ_ONLY_VARIANT_KEYS = {
+    "admin_graphql_api_id",
+    "created_at",
+    "updated_at",
+    "old_inventory_quantity",
+    "presentment_prices",
+}
+
+
+def _cache_key(prefix: str, *parts: Any) -> str:
+    user_scope = get_request_user_id() or "anon"
+    serialized = "|".join(str(p) for p in parts)
+    return f"{user_scope}:{prefix}:{serialized}"
+
+
+def _cache_get(key: str) -> Optional[Any]:
+    entry = _PRODUCT_CACHE.get(key)
+    if not entry:
+        return None
+    expires_at, payload = entry
+    if expires_at < time.time():
+        _PRODUCT_CACHE.pop(key, None)
+        return None
+    return payload
+
+
+def _cache_set(key: str, payload: Any, ttl_seconds: int):
+    _PRODUCT_CACHE[key] = (time.time() + ttl_seconds, payload)
+
+
+def _cache_invalidate_for_current_user():
+    user_scope = f"{get_request_user_id() or 'anon'}:"
+    to_remove = [k for k in _PRODUCT_CACHE.keys() if k.startswith(user_scope)]
+    for key in to_remove:
+        _PRODUCT_CACHE.pop(key, None)
 
 
 def _as_bool(v: Any) -> Optional[bool]:
@@ -47,8 +110,11 @@ def _normalize_collection_ids(value: Any) -> List[int]:
             continue
         if isinstance(item, dict):
             item = item.get("id") or item.get("value")
+        if item in (None, ""):
+            continue
         try:
-            collection_ids.append(int(item))
+            if isinstance(item, (int, float, str)):
+                collection_ids.append(int(item))
         except Exception:
             continue
     return sorted(set(collection_ids))
@@ -101,34 +167,16 @@ def _normalize_variants(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not variants_in and any([top_price, top_sku, top_barcode, top_compare, top_qty is not None]):
         variants_in = [{}]
 
-    allowed_variant_keys = {
-        "id",
-        "option1",
-        "option2",
-        "option3",
-        "price",
-        "compare_at_price",
-        "sku",
-        "barcode",
-        "taxable",
-        "requires_shipping",
-        "inventory_management",
-        "inventory_policy",
-        "inventory_quantity",
-        "weight",
-        "weight_unit",
-        "grams",
-    }
-
     normalized: List[Dict[str, Any]] = []
     for idx, raw in enumerate(variants_in):
         if not isinstance(raw, dict):
             continue
 
-        v: Dict[str, Any] = {}
-        for k in allowed_variant_keys:
-            if k in raw and raw[k] is not None and raw[k] != "":
-                v[k] = raw[k]
+        v: Dict[str, Any] = {
+            k: val
+            for k, val in raw.items()
+            if k not in _READ_ONLY_VARIANT_KEYS and val is not None and val != ""
+        }
 
         if "option1" not in v:
             name = _clean_str(raw.get("option1") or raw.get("name") or raw.get("title"))
@@ -196,24 +244,11 @@ def _normalize_variants(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def normalize_product_payload(product_data: Dict[str, Any], is_update: bool = False) -> Dict[str, Any]:
     payload = product_data if isinstance(product_data, dict) else {}
-    clean: Dict[str, Any] = {}
-
-    # Accept common direct Shopify fields
-    allowed_product_keys = {
-        "title",
-        "body_html",
-        "vendor",
-        "product_type",
-        "handle",
-        "status",
-        "published",
-        "published_scope",
-        "tags",
-        "template_suffix",
+    clean: Dict[str, Any] = {
+        k: v
+        for k, v in payload.items()
+        if k not in _READ_ONLY_PRODUCT_KEYS and k not in _FRONTEND_ONLY_PRODUCT_KEYS and v is not None
     }
-    for k in allowed_product_keys:
-        if k in payload and payload[k] is not None:
-            clean[k] = payload[k]
 
     # Accept AddProductPage aliases
     if "description" in payload and "body_html" not in clean:
@@ -252,12 +287,6 @@ def normalize_product_payload(product_data: Dict[str, Any], is_update: bool = Fa
     if variants:
         clean["variants"] = variants
 
-    # Tolerate extra AddProductPage-only fields by accepting and dropping them silently here.
-    _ = payload.get("costPerItem")
-    _ = payload.get("collections")
-    _ = payload.get("seo")
-    _ = payload.get("chargeTax")
-
     if is_update:
         clean.pop("title", None) if clean.get("title") == "" else None
 
@@ -269,7 +298,8 @@ def _extract_variant_cost(payload: Dict[str, Any]) -> Optional[str]:
     if top_level_cost is not None:
         return top_level_cost
 
-    variants = payload.get("variants") if isinstance(payload.get("variants"), list) else []
+    raw_variants = payload.get("variants")
+    variants: List[Any] = raw_variants if isinstance(raw_variants, list) else []
     for variant in variants:
         if not isinstance(variant, dict):
             continue
@@ -356,19 +386,43 @@ def _enrich_product_for_editor(shopify, product: Dict[str, Any]) -> Dict[str, An
 # ── IMPORTANT: all fixed-path routes MUST come before /{product_id} ──────────
 
 @router.get("")
-async def list_products(
-    limit: Optional[int] = Query(None),
+def list_products(
+    limit: int = Query(60, ge=1, le=250),
     status: str = Query("any"),
     search: Optional[str] = None,
-    fetch_all: bool = Query(False)
+    fetch_all: bool = Query(False),
+    page_info: Optional[str] = Query(None),
 ):
     try:
         logger.info(f"[Products] GET request - limit: {limit}, status: {status}, search: {search}, fetch_all: {fetch_all}")
+
+        cache_key = _cache_key("products", limit, status, search or "", fetch_all, page_info or "")
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         shopify = get_shopify_client()
-        result = shopify.get_products(limit=limit, status=status, title=search, fetch_all=fetch_all)
+        result = shopify.get_products(
+            limit=limit,
+            status=status,
+            title=search,
+            fetch_all=fetch_all,
+            page_info=page_info,
+        )
         products = result.get("products", [])
         logger.info(f"[Products] ✅ Got {len(products)} products")
-        return {"products": products, "count": len(products)}
+
+        response = {
+            "products": products,
+            "count": len(products),
+            "next_page_info": result.get("next_page_info"),
+            "has_next_page": bool(result.get("has_next_page")),
+        }
+        if result.get("partial"):
+            response["partial"] = True
+            response["partial_error"] = result.get("error") or "Partial product data returned"
+        _cache_set(cache_key, response, ttl_seconds=20)
+        return response
     except HTTPException:
         raise
     except Exception as e:
@@ -377,12 +431,19 @@ async def list_products(
 
 
 @router.get("/count")
-async def count_products(status: str = Query("any")):
+def count_products(status: str = Query("any")):
     """Return the total product count from Shopify (fast, no product data)."""
     try:
+        cache_key = _cache_key("products-count", status)
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         shopify = get_shopify_client()
         result = shopify.count_products()
-        return {"count": result.get("count", 0)}
+        response = {"count": result.get("count", 0)}
+        _cache_set(cache_key, response, ttl_seconds=30)
+        return response
     except HTTPException:
         raise
     except Exception as e:
@@ -390,7 +451,7 @@ async def count_products(status: str = Query("any")):
 
 
 @router.get("/all")
-async def fetch_all_products(status: str = Query("any")):
+def fetch_all_products(status: str = Query("any")):
     """Stream all products page-by-page as NDJSON so the frontend can show progress.
 
     Each line is a JSON object:
@@ -404,9 +465,8 @@ async def fetch_all_products(status: str = Query("any")):
 
     def generate():
         page_size = 250
-        params = {
+        params: Dict[str, Any] = {
             "limit": page_size,
-            "fields": "id,title,vendor,status,handle,image,images,variants",
         }
         if status and status != "any":
             params["status"] = status
@@ -452,7 +512,7 @@ async def fetch_all_products(status: str = Query("any")):
 
 
 @router.get("/sync")
-async def sync_products():
+def sync_products():
     try:
         shopify = get_shopify_client()
         
@@ -480,7 +540,7 @@ async def sync_products():
 
 
 @router.get("/find-duplicates")
-async def find_duplicate_products():
+def find_duplicate_products():
     """Find duplicate products without deleting them."""
     try:
         shopify = get_shopify_client()
@@ -514,7 +574,7 @@ async def find_duplicate_products():
 
 
 @router.post("/remove-duplicates")
-async def remove_duplicate_products():
+def remove_duplicate_products():
     """Find and delete duplicate products. Keeps first occurrence, deletes the rest."""
     try:
         shopify = get_shopify_client()
@@ -543,6 +603,9 @@ async def remove_duplicate_products():
             except Exception as e:
                 errors.append({"title": dup["title"], "error": str(e)})
 
+        if deleted:
+            _cache_invalidate_for_current_user()
+
         return {
             "total_scanned": len(products),
             "duplicates_found": len(duplicates),
@@ -559,7 +622,7 @@ async def remove_duplicate_products():
 
 
 @router.post("/bulk-create")
-async def bulk_create_products(products: List[dict]):
+def bulk_create_products(products: List[dict]):
     try:
         shopify = get_shopify_client()
         results, errors = [], []
@@ -568,6 +631,8 @@ async def bulk_create_products(products: List[dict]):
                 results.append(shopify.create_product(product_data))
             except Exception as e:
                 errors.append({"index": idx, "error": str(e), "title": product_data.get("title")})
+        if results:
+            _cache_invalidate_for_current_user()
         return {"created": len(results), "failed": len(errors), "results": results, "errors": errors}
     except HTTPException:
         raise
@@ -576,7 +641,7 @@ async def bulk_create_products(products: List[dict]):
 
 
 @router.post("/bulk-update")
-async def bulk_update_products(updates: List[dict]):
+def bulk_update_products(updates: List[dict]):
     try:
         shopify = get_shopify_client()
         results, errors = [], []
@@ -589,6 +654,8 @@ async def bulk_update_products(updates: List[dict]):
                 results.append(shopify.update_product(product_id, update))
             except Exception as e:
                 errors.append({"id": product_id, "error": str(e)})
+        if results:
+            _cache_invalidate_for_current_user()
         return {"updated": len(results), "failed": len(errors), "results": results, "errors": errors}
     except HTTPException:
         raise
@@ -599,13 +666,19 @@ async def bulk_update_products(updates: List[dict]):
 # ── Routes with path params MUST come AFTER all fixed-path routes ─────────────
 
 @router.get("/{product_id}")
-async def get_product(product_id: int):
+def get_product(product_id: int):
     try:
+        cache_key = _cache_key("product-detail", product_id)
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
+
         shopify = get_shopify_client()
         result = shopify.get_product(product_id)
         product = result.get("product") if isinstance(result, dict) else None
         if isinstance(product, dict):
             result["product"] = _enrich_product_for_editor(shopify, product)
+        _cache_set(cache_key, result, ttl_seconds=15)
         return result
     except HTTPException:
         raise
@@ -614,7 +687,7 @@ async def get_product(product_id: int):
 
 
 @router.post("")
-async def create_product(product_data: dict):
+def create_product(product_data: dict):
     try:
         normalized = normalize_product_payload(product_data, is_update=False)
         if "title" not in normalized:
@@ -625,6 +698,7 @@ async def create_product(product_data: dict):
         if isinstance(product, dict):
             _apply_post_product_updates(shopify, product, product_data)
             result["product"] = _enrich_product_for_editor(shopify, product)
+        _cache_invalidate_for_current_user()
         return result
     except HTTPException:
         raise
@@ -633,7 +707,7 @@ async def create_product(product_data: dict):
 
 
 @router.put("/{product_id}")
-async def update_product(product_id: int, product_data: dict):
+def update_product(product_id: int, product_data: dict):
     try:
         normalized = normalize_product_payload(product_data, is_update=True)
         shopify = get_shopify_client()
@@ -645,6 +719,7 @@ async def update_product(product_id: int, product_data: dict):
             refreshed_product = refreshed.get("product") if isinstance(refreshed, dict) else None
             if isinstance(refreshed_product, dict):
                 result["product"] = _enrich_product_for_editor(shopify, refreshed_product)
+        _cache_invalidate_for_current_user()
         return result
     except HTTPException:
         raise
@@ -653,10 +728,11 @@ async def update_product(product_id: int, product_data: dict):
 
 
 @router.delete("/{product_id}")
-async def delete_product(product_id: int):
+def delete_product(product_id: int):
     try:
         shopify = get_shopify_client()
         shopify.delete_product(product_id)
+        _cache_invalidate_for_current_user()
         return {"message": f"Product {product_id} deleted successfully"}
     except HTTPException:
         raise
@@ -665,9 +741,11 @@ async def delete_product(product_id: int):
 
 
 @router.put("/{product_id}/variants/{variant_id}")
-async def update_variant(product_id: int, variant_id: int, variant_data: dict):
+def update_variant(product_id: int, variant_id: int, variant_data: dict):
     try:
         shopify = get_shopify_client()
-        return shopify.update_product_variant(product_id, variant_id, variant_data)
+        result = shopify.update_product_variant(product_id, variant_id, variant_data)
+        _cache_invalidate_for_current_user()
+        return result
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
