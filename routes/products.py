@@ -3,7 +3,7 @@ from fastapi.responses import StreamingResponse
 from typing import Optional, List, Any, Dict
 import logging, json
 import time
-from .store_utils import get_shopify_client, get_request_user_id
+from .store_utils import get_shopify_client, get_request_user_id, get_active_store_key
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -45,8 +45,9 @@ _READ_ONLY_VARIANT_KEYS = {
 
 def _cache_key(prefix: str, *parts: Any) -> str:
     user_scope = get_request_user_id() or "anon"
+    store_scope = get_active_store_key(user_id=get_request_user_id()) or "no-store"
     serialized = "|".join(str(p) for p in parts)
-    return f"{user_scope}:{prefix}:{serialized}"
+    return f"{user_scope}:{store_scope}:{prefix}:{serialized}"
 
 
 def _cache_get(key: str) -> Optional[Any]:

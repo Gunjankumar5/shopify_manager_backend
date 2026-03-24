@@ -42,11 +42,16 @@ def _numeric_id(gid: str) -> str:
     return str(gid).split("/")[-1]
 
 
-def _diff_row(row: dict, snapshot: dict) -> tuple[dict, dict]:
+def _diff_row(row: dict, snapshot: dict) -> tuple[dict, dict, str]:
+    """
+    Compare a row to snapshot and return (product_changes, variant_changes, error_msg).
+    error_msg is None if product found in snapshot, or a descriptive error if not.
+    """
     product_gid = row.get("Product ID", "")
     snap_entry  = snapshot.get(product_gid)
     if not snap_entry:
-        return {}, {}
+        # Return empty changes and an error code so caller can handle appropriately
+        return {}, {}, f"not_in_snapshot"
 
     snap_product  = snap_entry.get("product", {})
     snap_variants = snap_entry.get("variants", [])
@@ -90,7 +95,7 @@ def _diff_row(row: dict, snapshot: dict) -> tuple[dict, dict]:
         if str(new_val or "") != str(old_val or ""):
             variant_changes[api_key] = str(new_val) if new_val else None
 
-    return product_changes, variant_changes
+    return product_changes, variant_changes, None  # None = no error
 
 
 def run_sync(
@@ -140,16 +145,28 @@ def run_sync(
             product_id  = _numeric_id(product_gid)
             variant_id  = _numeric_id(variant_gid)
 
+            # ── Validate Product ID format ────────────────────────────────
             if not product_id.isdigit():
-                push({"row_index": idx, "variant_id": variant_gid, "status": "SKIPPED", "changes": [], "error": "Missing Product ID"})
+                error_msg = f"Invalid Product ID: {product_gid or '(empty)'}"
+                push({"row_index": idx, "variant_id": variant_gid, "status": "SKIPPED", "changes": [], "error": error_msg})
                 counts["skipped"] += 1
+                _log(f"session={session_id} row={idx+1} SKIPPED {error_msg}")
                 continue
 
             try:
-                product_changes, variant_changes = _diff_row(row, snapshot)
+                product_changes, variant_changes, diff_error = _diff_row(row, snapshot)
 
+                # ── Check for products not in snapshot ────────────────────
+                if diff_error == "not_in_snapshot":
+                    error_msg = "Product not in snapshot (may be newly created)"
+                    push({"row_index": idx, "variant_id": variant_gid, "status": "SKIPPED", "changes": [], "error": error_msg})
+                    counts["skipped"] += 1
+                    _log(f"session={session_id} row={idx+1} SKIPPED product not in snapshot")
+                    continue
+
+                # ── Check if there are any actual changes ──────────────────
                 if not product_changes and not variant_changes:
-                    push({"row_index": idx, "variant_id": variant_gid, "status": "SKIPPED", "changes": [], "error": None})
+                    push({"row_index": idx, "variant_id": variant_gid, "status": "SKIPPED", "changes": [], "error": "No changes detected"})
                     counts["skipped"] += 1
                     continue
 

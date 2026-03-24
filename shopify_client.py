@@ -891,3 +891,78 @@ class ShopifyClient:
         )
         r.raise_for_status()
         return r.json()
+    
+    # =========================================================
+    # METAFIELDS (REST)
+    # =========================================================
+
+    def get_metafields(self, resource: str, resource_id: int) -> dict:
+        all_metafields = []
+        url = f"{self._get_base_url()}/{resource}/{resource_id}/metafields.json"
+        params = {"limit": 250}
+        first = True
+
+        while url:
+            r = self._request("GET", url, params=params if first else {}, timeout=30)
+            r.raise_for_status()
+            all_metafields.extend(r.json().get("metafields", []))
+            url = r.links.get("next", {}).get("url")
+            first = False
+
+        return {"metafields": all_metafields}
+
+    def create_metafield(self, resource: str, resource_id: int, data: dict) -> dict:
+        r = self._request(
+            "POST",
+            f"{self._get_base_url()}/{resource}/{resource_id}/metafields.json",
+            json={"metafield": data},
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def update_metafield(self, metafield_id: int, data: dict) -> dict:
+        r = self._request(
+            "PUT",
+            f"{self._get_base_url()}/metafields/{metafield_id}.json",
+            json={"metafield": {"id": metafield_id, **data}},
+            timeout=30,
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def delete_metafield(self, metafield_id: int) -> dict:
+        r = self._request(
+            "DELETE",
+            f"{self._get_base_url()}/metafields/{metafield_id}.json",
+            timeout=30,
+        )
+        r.raise_for_status()
+        return {"deleted": True}
+
+    def get_metafield_definitions(self, owner_type: str) -> dict:
+        query = """
+        query GetMetafieldDefinitions($ownerType: MetafieldOwnerType!, $first: Int!) {
+            metafieldDefinitions(first: $first, ownerType: $ownerType) {
+                edges {
+                    node {
+                        id
+                        namespace
+                        key
+                        name
+                        description
+                        type { name category }
+                        validations { name type value }
+                        visibleToStorefrontApi
+                        pinnedPosition
+                    }
+                }
+            }
+        }
+        """
+        result = self.graphql(query, {"ownerType": owner_type, "first": 250})
+        definitions = [
+            edge["node"]
+            for edge in result.get("metafieldDefinitions", {}).get("edges", [])
+        ]
+        return {"definitions": definitions}

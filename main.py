@@ -9,9 +9,10 @@ import asyncio, os, time, logging
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 
-from routes import products, collections, inventory, upload, export, auth
+from routes import products, collections, inventory, upload, export, auth, metafields, users
 from routes.store_utils import get_connected_store, load_all_user_stores, save_stores, set_request_user_id
 from routes.auth_utils import resolve_user_id_from_request
+from routes.user_utils import initialize_admin_user
 import requests
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,20 @@ async def token_refresh_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Initialize admin user if none exists (for testing/demo)
+    try:
+        from routes.user_utils import load_users
+        if not load_users():
+            logger.info("🔧 Initializing default admin user for demo/testing...")
+            initialize_admin_user(
+                admin_user_id="demo_admin_user",
+                email="admin@shopmanager.local",
+                full_name="Admin User"
+            )
+            logger.info("✅ Demo admin user created (user_id: demo_admin_user)")
+    except Exception as e:
+        logger.warning(f"Could not initialize admin user: {e}")
+
     task = asyncio.create_task(token_refresh_loop())
     logger.info("🚀 Multi-store token auto-refresh started")
     yield
@@ -110,11 +125,13 @@ app.add_middleware(RequestUserContextMiddleware)
 
 # ── Routes — prefix added HERE, not inside the router files ──────────────────
 app.include_router(auth.router,        prefix="/api/auth",        tags=["Auth"])
+app.include_router(users.router,       prefix="/api/users",       tags=["Users"])
 app.include_router(products.router,    prefix="/api/products",    tags=["Products"])
 app.include_router(collections.router, prefix="/api/collections", tags=["Collections"])
 app.include_router(inventory.router,   prefix="/api/inventory",   tags=["Inventory"])
 app.include_router(upload.router,      prefix="/api/upload",      tags=["Upload"])
 app.include_router(export.router,      prefix="/api/export",      tags=["Export"])
+app.include_router(metafields.router, prefix="/api/metafields", tags=["Metafields"])
 
 
 @app.get("/")

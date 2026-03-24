@@ -202,8 +202,8 @@ async def push_to_shopify(products: List[dict]):
         # Group rows by Handle for multi-variant products
         grouped = {}
         for row in products:
-            handle = (row.get("Handle") or row.get("handle") or "").strip()
-            title = (row.get("Title") or row.get("title") or "").strip()
+            handle = (row.get("Handle") or row.get("handle") or row.get("HANDLE") or "").strip()
+            title = (row.get("Title") or row.get("title") or row.get("TITLE") or "").strip()
 
             if not handle and not title:
                 continue
@@ -236,16 +236,27 @@ async def push_to_shopify(products: List[dict]):
                 seen_titles.add(title_lower)
 
             if key not in grouped:
+                # Extract status from row with fallbacks, default to "active"
+                status = (row.get("Status") or row.get("status") or row.get("STATUS") or "").strip().lower()
+                if status not in ["active", "draft", "archived"]:
+                    status = "active"
+                
                 grouped[key] = {
                     "title": title,
-                    "body_html": row.get("Body (HTML)") or row.get("body_html") or "",
-                    "vendor": row.get("Vendor") or row.get("vendor") or "",
-                    "product_type": row.get("Type") or row.get("product_type") or "",
-                    "tags": row.get("Tags") or row.get("tags") or "",
-                    "status": "draft",
+                    "body_html": row.get("Body (HTML)") or row.get("body_html") or row.get("BODY (HTML)") or "",
+                    "vendor": row.get("Vendor") or row.get("vendor") or row.get("VENDOR") or "",
+                    "product_type": row.get("Type") or row.get("product_type") or row.get("TYPE") or "",
+                    "tags": row.get("Tags") or row.get("tags") or row.get("TAGS") or "",
+                    "status": status,
                     "variants": [],
-                    "images": []
+                    "images": [],
+                    "seo_title": "",
+                    "seo_description": ""
                 }
+                
+                # Store SEO data (don't include in product data, will set after creation)
+                grouped[key]["seo_title"] = row.get("SEO TITLE") or row.get("Seo Title") or row.get("SEO Title") or row.get("seo_title") or ""
+                grouped[key]["seo_description"] = row.get("SEO DESCRIPTION") or row.get("Seo Description") or row.get("SEO Description") or row.get("seo_description") or ""
 
             _add_variant_to_group(grouped[key], row)
 
@@ -254,6 +265,10 @@ async def push_to_shopify(products: List[dict]):
         # Push each unique product to Shopify
         for key, product_data in grouped.items():
             try:
+                # Extract SEO data before sending to API
+                seo_title = product_data.pop("seo_title", "")
+                seo_desc = product_data.pop("seo_description", "")
+                
                 if not product_data["variants"]:
                     del product_data["variants"]
                 if not product_data["images"]:
@@ -270,9 +285,22 @@ async def push_to_shopify(products: List[dict]):
                         r = client.create_product(product_data)
                     else:
                         raise
+                
+                product_id = r.get("product", {}).get("id")
+                
+                # Set SEO data after product creation
+                if product_id and (seo_title or seo_desc):
+                    try:
+                        print(f"📝 Setting SEO for product {product_id}")
+                        client.set_product_seo(product_id, title=seo_title or None, description=seo_desc or None)
+                        print(f"✅ SEO set successfully")
+                    except Exception as seo_err:
+                        print(f"⚠️ Warning: Failed to set SEO data: {seo_err}")
+                        # Don't fail the product creation if SEO fails
+                
                 results["success"].append({
                     "title": product_data.get("title"),
-                    "id": r.get("product", {}).get("id")
+                    "id": product_id
                 })
                 results["created"] += 1
             except Exception as e:
@@ -292,11 +320,11 @@ async def push_to_shopify(products: List[dict]):
 def _add_variant_to_group(product_group: dict, row: dict):
     """Extract variant data from a row and add to product group"""
     variant = {}
-    price = row.get("Variant Price") or row.get("price") or ""
-    sku = row.get("Variant SKU") or row.get("sku") or ""
-    qty = row.get("Variant Inventory Qty") or row.get("inventory_quantity") or ""
-    barcode = row.get("Variant Barcode") or row.get("barcode") or ""
-    compare_price = row.get("Variant Compare At Price") or row.get("compare_at_price") or ""
+    price = row.get("Variant Price") or row.get("price") or row.get("VARIANT PRICE") or ""
+    sku = row.get("Variant SKU") or row.get("sku") or row.get("VARIANT SKU") or ""
+    qty = row.get("Variant Inventory Qty") or row.get("inventory_quantity") or row.get("VARIANT INVENTORY QTY") or ""
+    barcode = row.get("Variant Barcode") or row.get("barcode") or row.get("VARIANT BARCODE") or ""
+    compare_price = row.get("Variant Compare At Price") or row.get("compare_at_price") or row.get("VARIANT COMPARE AT PRICE") or ""
 
     if price:
         variant["price"] = str(price)
@@ -315,7 +343,7 @@ def _add_variant_to_group(product_group: dict, row: dict):
     if variant:
         product_group["variants"].append(variant)
 
-    img = row.get("Image Src") or row.get("image_src") or ""
+    img = row.get("Image Src") or row.get("image_src") or row.get("IMAGE URLS") or row.get("Image URLs") or row.get("IMAGE SRC") or ""
     if img:
         img_src = str(img)
         existing_srcs = [i["src"] for i in product_group["images"]]
