@@ -8,6 +8,7 @@ import importlib
 import json
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
+from services.metafield_defs import fetch_and_store_metafield_defs, get_display_name_map
 
 _orjson = None
 try:
@@ -58,15 +59,19 @@ class BulkFetchService:
         log(f"Inventory items: {len(inventory_ids)}")
         log(f"Products: {len(product_ids)}")
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             inventory_future          = executor.submit(self._fetch_inventory_levels, inventory_ids, locations)
             collections_future        = executor.submit(self._fetch_collections)
             product_metafields_future = executor.submit(self._fetch_product_metafields, product_ids)
+            metafield_defs_future     = executor.submit(fetch_and_store_metafield_defs, self.client)
 
-        inventory_levels             = inventory_future.result()
-        product_collections          = collections_future.result()
-        product_metafield_result     = product_metafields_future.result() or ({}, [])
+        inventory_levels         = inventory_future.result()
+        product_collections      = collections_future.result()
+        product_metafield_result = product_metafields_future.result() or ({}, [])
+        _                        = metafield_defs_future.result()
         product_metafield_values, product_metafield_columns = product_metafield_result
+
+        display_name_map = get_display_name_map()
 
         log("Applying inventory levels...")
         for row in rows:
@@ -77,31 +82,33 @@ class BulkFetchService:
 
         log("Applying metafields and collections...")
         for row in rows:
+
             pid = row["Product ID"]
-
-            # ── ONE COLUMN PER METAFIELD ──────────────────────────────────
-            # Each metafield gets its own column named "Metafield: ns.key"
-            # e.g. "Metafield: custom.color", "Metafield: custom.size"
             metafield_values = product_metafield_values.get(pid, {})
-            for col in product_metafield_columns:
-                row[col] = metafield_values.get(col, "")
 
-            # Keep the combined column as well for backward compatibility
+            # All columns from definitions (includes ones with null values)
+            all_metafield_cols = set(product_metafield_columns) | set(display_name_map.keys())
+
+            for col in sorted(all_metafield_cols):
+              display_name = display_name_map.get(col, col)
+              row[display_name] = metafield_values.get(col, "")  # "" for null/missing
+
+            # Combined column for backward compatibility
             combined = " | ".join(
-                f"{col}={metafield_values[col]}"
-                for col in product_metafield_columns
-                if metafield_values.get(col, "") != ""
+              f"{col}={metafield_values[col]}"
+              for col in product_metafield_columns
+              if metafield_values.get(col, "") != ""
             )
             row["Product Metafields"] = combined
 
-            # ── Collections ───────────────────────────────────────────────
+            # Collections
             if pid in product_collections:
-                row["Collection Names"]     = ", ".join(product_collections[pid]["names"])
-                row["Collection Handles"]   = ", ".join(product_collections[pid]["handles"])
+                row["Collection Names"]      = ", ".join(product_collections[pid]["names"])
+                row["Collection Handles"]    = ", ".join(product_collections[pid]["handles"])
                 row["Collection Metafields"] = " | ".join(product_collections[pid]["metafields"])
             else:
-                row["Collection Names"]     = ""
-                row["Collection Handles"]   = ""
+                row["Collection Names"]      = ""
+                row["Collection Handles"]    = ""
                 row["Collection Metafields"] = ""
 
         log("Sync complete.")
@@ -151,10 +158,10 @@ class BulkFetchService:
     def export_to_excel(self, progress_callback=None) -> bytes:
 
         rows, _ = self.full_sync(progress_callback=progress_callback)
-
         df = pd.DataFrame.from_records(rows)
 
-        # Separate metafield columns from the rest
+        # Detect metafield columns (contain a dot, e.g. "Snowboard length" won't,
+        # but fallback ns.key columns like "custom.color" will)
         metafield_cols = sorted([c for c in df.columns if "." in c])
 
         priority = [
@@ -162,8 +169,8 @@ class BulkFetchService:
             "Product ID", "Handle", "Title", "Body (HTML)", "Vendor", "Type",
             "Tags", "Status",
             "SEO Title", "SEO Description",
-            "Product Metafields",       # combined (kept for backward compat)
-            *metafield_cols,            # individual metafield columns
+            "Product Metafields",
+            *metafield_cols,
             "Collection Metafields",
             "Variant ID", "Variant SKU", "Variant Price", "Variant Compare At Price",
             "Variant Barcode", "Variant Inventory Policy",
@@ -178,11 +185,9 @@ class BulkFetchService:
         df = df[existing_priority + remaining]
 
         buf = io.BytesIO()
-
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
             df.to_excel(writer, index=False, sheet_name="Products")
             ws = writer.sheets["Products"]
-
             width_sample = df.head(self.MAX_WIDTH_SAMPLE_ROWS).fillna("")
             for i, col in enumerate(df.columns):
                 sample_values = width_sample[col].astype(str)
@@ -335,12 +340,11 @@ class BulkFetchService:
 
     def _parse_jsonl(self, path):
 
-        rows     = []
-        snapshot = {}
-
-        products              = {}
-        variants              = []
-        product_images        = {}
+        rows                    = []
+        snapshot                = {}
+        products                = {}
+        variants                = []
+        product_images          = {}
         product_metafield_nodes = {}
 
         with open(path, "rb") as f:
@@ -367,8 +371,8 @@ class BulkFetchService:
                     parent = obj.get("__parentId")
                     if parent and (
                         obj.get("namespace") is not None
-                        or obj.get("key")       is not None
-                        or obj.get("value")     is not None
+                        or obj.get("key")    is not None
+                        or obj.get("value")  is not None
                     ):
                         product_metafield_nodes.setdefault(parent, []).append(obj)
 
@@ -404,39 +408,38 @@ class BulkFetchService:
                 weight    = (inventory.get("measurement") or {}).get("weight") or {}
 
                 row = {
-                    "Product ID":                pid,
-                    "Handle":                    product.get("handle"),
-                    "Title":                     product.get("title"),
-                    "Body (HTML)":               product.get("descriptionHtml"),
-                    "Vendor":                    product.get("vendor"),
-                    "Type":                      product.get("productType"),
-                    "Tags":                      ", ".join(product.get("tags", [])),
-                    "Status":                    product.get("status"),
-                    "Created At":                product.get("createdAt"),
-                    "Updated At":                product.get("updatedAt"),
-                    "SEO Title":                 (product.get("seo") or {}).get("title"),
-                    "SEO Description":           (product.get("seo") or {}).get("description"),
-                    # Combined metafields column (all in one)
-                    "Product Metafields":        " | ".join(product_metafields),
-                    "Image URLs":                image_urls,
-                    "Image Alt Text":            image_alt_texts,
-                    "Variant ID":                variant.get("id"),
-                    "Variant SKU":               variant.get("sku"),
-                    "Variant Price":             variant.get("price"),
-                    "Variant Compare At Price":  variant.get("compareAtPrice"),
-                    "Variant Barcode":           variant.get("barcode"),
-                    "Variant Inventory Policy":  variant.get("inventoryPolicy"),
-                    "Inventory Item ID":         inventory.get("id"),
-                    "Inventory Tracked":         inventory.get("tracked"),
-                    "Requires Shipping":         inventory.get("requiresShipping"),
-                    "Cost per item":             (inventory.get("unitCost") or {}).get("amount"),
-                    "Variant Grams":             weight.get("value"),
-                    "Variant Weight Unit":       weight.get("unit"),
-                    "Last Synced":               now,
+                    "Product ID":               pid,
+                    "Handle":                   product.get("handle"),
+                    "Title":                    product.get("title"),
+                    "Body (HTML)":              product.get("descriptionHtml"),
+                    "Vendor":                   product.get("vendor"),
+                    "Type":                     product.get("productType"),
+                    "Tags":                     ", ".join(product.get("tags", [])),
+                    "Status":                   product.get("status"),
+                    "Created At":               product.get("createdAt"),
+                    "Updated At":               product.get("updatedAt"),
+                    "SEO Title":                (product.get("seo") or {}).get("title"),
+                    "SEO Description":          (product.get("seo") or {}).get("description"),
+                    "Product Metafields":       " | ".join(product_metafields),
+                    "Image URLs":               image_urls,
+                    "Image Alt Text":           image_alt_texts,
+                    "Variant ID":               variant.get("id"),
+                    "Variant SKU":              variant.get("sku"),
+                    "Variant Price":            variant.get("price"),
+                    "Variant Compare At Price": variant.get("compareAtPrice"),
+                    "Variant Barcode":          variant.get("barcode"),
+                    "Variant Inventory Policy": variant.get("inventoryPolicy"),
+                    "Inventory Item ID":        inventory.get("id"),
+                    "Inventory Tracked":        inventory.get("tracked"),
+                    "Requires Shipping":        inventory.get("requiresShipping"),
+                    "Cost per item":            (inventory.get("unitCost") or {}).get("amount"),
+                    "Variant Grams":            weight.get("value"),
+                    "Variant Weight Unit":      weight.get("unit"),
+                    "Last Synced":              now,
                 }
 
-                # ── Individual metafield columns ──────────────────────────
-                # Parse "ns.key=value" strings into separate columns
+                # Individual metafield columns using ns.key as key
+                # (display name mapping happens later in full_sync)
                 for mf in product_metafields:
                     if "=" in mf:
                         col_key, _, col_val = mf.partition("=")
@@ -499,7 +502,6 @@ class BulkFetchService:
         for i in range(0, len(inventory_item_ids), BATCH):
             batch  = inventory_item_ids[i:i + BATCH]
             result = self.client.graphql(query, {"ids": batch})
-
             for node in result["nodes"]:
                 if not node:
                     continue
@@ -565,12 +567,13 @@ class BulkFetchService:
                     key = str(mf_node.get("key") or "").strip()
                     if not ns or not key:
                         continue
-                    col_name        = f"{ns}.{key}"
-                    value           = mf_node.get("value")
+                    col_name         = f"{ns}.{key}"
+                    value            = mf_node.get("value")
                     fields[col_name] = "" if value is None else str(value)
                     all_columns.add(col_name)
                 output[pid] = fields
 
+        # ← FIXED: return is now OUTSIDE the for loop
         return output, sorted(all_columns)
 
     # =========================================================
