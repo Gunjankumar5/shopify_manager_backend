@@ -1,22 +1,17 @@
 """
 Shared store persistence utilities used by all routes.
 
-Data files live in  backend/data/
-    stores.json       — credentials + tokens scoped per authenticated user
-    active_store.json — active store key scoped per authenticated user
+Stores are persisted in Supabase `connected_stores` table — NOT local JSON files.
+This means store connections survive Railway redeploys and work from any device.
 """
-from pathlib import Path
 from contextvars import ContextVar
-import json, time, requests, logging
+import time, requests, logging, os
 from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR         = Path(__file__).parent.parent / "data"
-STORES_FILE      = DATA_DIR / "stores.json"
-ACTIVE_STORE_FILE = DATA_DIR / "active_store.json"
-TOKEN_REFRESH_WINDOW_SECONDS = 300
 REQUEST_USER_ID: ContextVar[str | None] = ContextVar("request_user_id", default=None)
+TOKEN_REFRESH_WINDOW_SECONDS = 300
 
 
 def set_request_user_id(user_id: str | None):
@@ -27,246 +22,240 @@ def get_request_user_id() -> str | None:
     return REQUEST_USER_ID.get()
 
 
-def _is_store_record(value: object) -> bool:
-    return isinstance(value, dict) and "shop" in value
+# ── Supabase client ───────────────────────────────────────────────────────────
 
-
-def _read_stores_raw() -> dict:
-    if not STORES_FILE.exists():
-        return {}
+def _get_supabase():
+    """Get Supabase admin client using service role key (bypasses RLS)."""
     try:
-        data = json.loads(STORES_FILE.read_text())
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+        from supabase import create_client
+        url = os.getenv("SUPABASE_URL", "").strip()
+        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+        if not url or not key:
+            raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment variables")
+        return create_client(url, key)
+    except ImportError:
+        raise HTTPException(status_code=503, detail="supabase package not installed. Run: pip install supabase")
+    except Exception as e:
+        logger.error(f"Supabase client error: {e}")
+        raise HTTPException(status_code=503, detail=f"Database connection failed: {str(e)}")
 
 
-def _write_stores_raw(data: dict):
-    DATA_DIR.mkdir(exist_ok=True)
-    STORES_FILE.write_text(json.dumps(data, indent=2))
+# ── Row → dict helper ─────────────────────────────────────────────────────────
+
+def _row_to_store(row: dict) -> dict:
+    return {
+        "shop":             row.get("shop"),
+        "shop_name":        row.get("shop_name"),
+        "api_key":          row.get("api_key"),
+        "api_secret":       row.get("api_secret"),
+        "access_token":     row.get("access_token"),
+        "token_expires_at": row.get("token_expires_at"),
+        "api_version":      row.get("api_version", "2026-01"),
+        "connected_at":     str(row.get("connected_at", "")),
+        "email":            row.get("email", ""),
+        "currency":         row.get("currency", ""),
+        "is_active":        row.get("is_active", False),
+    }
 
 
-def _read_active_map() -> dict:
-    if not ACTIVE_STORE_FILE.exists():
-        return {}
-    try:
-        data = json.loads(ACTIVE_STORE_FILE.read_text())
-        if not isinstance(data, dict):
-            return {}
-        if "active_store" in data:
-            # Backward compatibility with old single-active-store format.
-            value = data.get("active_store")
-            return {"__legacy__": value} if value else {}
-        return data
-    except Exception:
-        return {}
-
-
-def _write_active_map(data: dict):
-    DATA_DIR.mkdir(exist_ok=True)
-    if not data:
-        if ACTIVE_STORE_FILE.exists():
-            ACTIVE_STORE_FILE.unlink()
-        return
-    ACTIVE_STORE_FILE.write_text(json.dumps(data, indent=2))
-
-
-def _migrate_legacy_if_needed(user_id: str):
-    raw = _read_stores_raw()
-    if not raw or "users" in raw:
-        return
-
-    legacy_stores = {k: v for k, v in raw.items() if _is_store_record(v)}
-    if not legacy_stores:
-        return
-
-    logger.info(f"Migrating legacy stores.json to user-scoped schema for {user_id}")
-    _write_stores_raw({
-        "users": {
-            user_id: {
-                "stores": legacy_stores,
-            }
-        }
-    })
-
-    active_map = _read_active_map()
-    legacy_active = active_map.pop("__legacy__", None)
-    if legacy_active and user_id not in active_map:
-        active_map[user_id] = legacy_active
-        _write_active_map(active_map)
-
-
-# ── File I/O ──────────────────────────────────────────────────────────────────
+# ── Store CRUD ────────────────────────────────────────────────────────────────
 
 def load_stores(user_id: str | None = None) -> dict:
-    resolved_user_id = user_id or get_request_user_id()
-    if not resolved_user_id:
+    """Load all stores for a user. Returns { shop_key: store_dict }"""
+    resolved = user_id or get_request_user_id()
+    if not resolved:
         return {}
-
-    _migrate_legacy_if_needed(resolved_user_id)
-    raw = _read_stores_raw()
-    users = raw.get("users", {}) if isinstance(raw.get("users"), dict) else {}
-    user_entry = users.get(resolved_user_id, {})
-    stores = user_entry.get("stores", {}) if isinstance(user_entry, dict) else {}
-    return stores if isinstance(stores, dict) else {}
-
-
-def load_all_user_stores() -> dict[str, dict]:
-    raw = _read_stores_raw()
-    if not raw:
+    try:
+        result = _get_supabase() \
+            .table("connected_stores") \
+            .select("*") \
+            .eq("user_id", resolved) \
+            .execute()
+        return {
+            row["shop_key"]: _row_to_store(row)
+            for row in (result.data or [])
+            if row.get("shop_key")
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"load_stores error: {e}")
         return {}
-
-    if "users" in raw:
-        users = raw.get("users", {}) if isinstance(raw.get("users"), dict) else {}
-        result: dict[str, dict] = {}
-        for user_id, user_entry in users.items():
-            if not isinstance(user_entry, dict):
-                continue
-            stores = user_entry.get("stores", {})
-            if isinstance(stores, dict):
-                result[user_id] = stores
-        return result
-
-    # Legacy fallback
-    legacy_stores = {k: v for k, v in raw.items() if _is_store_record(v)}
-    return {"__legacy__": legacy_stores} if legacy_stores else {}
 
 
 def save_stores(stores: dict, user_id: str | None = None):
-    resolved_user_id = user_id or get_request_user_id()
-    if not resolved_user_id:
+    """Save multiple stores to Supabase."""
+    resolved = user_id or get_request_user_id()
+    if not resolved:
         raise HTTPException(status_code=401, detail="Authentication required")
-
-    _migrate_legacy_if_needed(resolved_user_id)
-    raw = _read_stores_raw()
-    users = raw.get("users", {}) if isinstance(raw.get("users"), dict) else {}
-    user_entry = users.get(resolved_user_id, {})
-    if not isinstance(user_entry, dict):
-        user_entry = {}
-    user_entry["stores"] = stores
-    users[resolved_user_id] = user_entry
-    _write_stores_raw({"users": users})
+    for shop_key, store in stores.items():
+        save_single_store(shop_key, store, user_id=resolved)
 
 
-# ── Active-store tracking ─────────────────────────────────────────────────────
+def save_single_store(shop_key: str, store: dict, user_id: str | None = None):
+    """Upsert a single store in Supabase."""
+    resolved = user_id or get_request_user_id()
+    if not resolved:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        _get_supabase().table("connected_stores").upsert({
+            "user_id":          resolved,
+            "shop_key":         shop_key,
+            "shop":             store.get("shop", ""),
+            "shop_name":        store.get("shop_name", ""),
+            "api_key":          store.get("api_key", ""),
+            "api_secret":       store.get("api_secret", ""),
+            "access_token":     store.get("access_token", ""),
+            "token_expires_at": store.get("token_expires_at"),
+            "api_version":      store.get("api_version", "2026-01"),
+            "email":            store.get("email", ""),
+            "currency":         store.get("currency", ""),
+            "is_active":        store.get("is_active", False),
+        }, on_conflict="user_id,shop_key").execute()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"save_single_store error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to save store: {str(e)}")
+
+
+def delete_store(shop_key: str, user_id: str | None = None):
+    """Delete a store from Supabase."""
+    resolved = user_id or get_request_user_id()
+    if not resolved:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        _get_supabase().table("connected_stores") \
+            .delete() \
+            .eq("user_id", resolved) \
+            .eq("shop_key", shop_key) \
+            .execute()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"delete_store error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete store: {str(e)}")
+
+
+# ── Active store ──────────────────────────────────────────────────────────────
 
 def get_active_store_key(user_id: str | None = None) -> str | None:
-    resolved_user_id = user_id or get_request_user_id()
-    if not resolved_user_id:
+    """Get active store key for a user from Supabase."""
+    resolved = user_id or get_request_user_id()
+    if not resolved:
         return None
-
-    active_map = _read_active_map()
-    if resolved_user_id in active_map:
-        return active_map.get(resolved_user_id)
-
-    # Fallback: most recently connected store for this user.
-    stores = load_stores(resolved_user_id)
-    if not stores:
+    try:
+        sb = _get_supabase()
+        # Try explicitly active store first
+        r = sb.table("connected_stores") \
+              .select("shop_key") \
+              .eq("user_id", resolved) \
+              .eq("is_active", True) \
+              .limit(1) \
+              .execute()
+        if r.data:
+            return r.data[0]["shop_key"]
+        # Fallback: most recently connected
+        r = sb.table("connected_stores") \
+              .select("shop_key") \
+              .eq("user_id", resolved) \
+              .order("connected_at", desc=True) \
+              .limit(1) \
+              .execute()
+        if r.data:
+            return r.data[0]["shop_key"]
         return None
-    return sorted(
-        stores.keys(),
-        key=lambda k: stores[k].get("connected_at", ""),
-        reverse=True,
-    )[0]
+    except Exception as e:
+        logger.error(f"get_active_store_key error: {e}")
+        return None
 
 
 def set_active_store_key(shop_key: str | None, user_id: str | None = None):
-    resolved_user_id = user_id or get_request_user_id()
-    if not resolved_user_id:
+    """Set active store for a user in Supabase."""
+    resolved = user_id or get_request_user_id()
+    if not resolved:
         raise HTTPException(status_code=401, detail="Authentication required")
+    try:
+        sb = _get_supabase()
+        # Deactivate all
+        sb.table("connected_stores") \
+          .update({"is_active": False}) \
+          .eq("user_id", resolved) \
+          .execute()
+        # Activate selected
+        if shop_key:
+            sb.table("connected_stores") \
+              .update({"is_active": True}) \
+              .eq("user_id", resolved) \
+              .eq("shop_key", shop_key) \
+              .execute()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"set_active_store_key error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to set active store: {str(e)}")
 
-    active_map = _read_active_map()
-    if shop_key is None:
-        active_map.pop(resolved_user_id, None)
-    else:
-        active_map[resolved_user_id] = shop_key
-    _write_active_map(active_map)
 
+# ── Token refresh ─────────────────────────────────────────────────────────────
 
-# ── Store + client helpers ────────────────────────────────────────────────────
-
-def _refresh_store_token(stores: dict, store_key: str, store: dict, user_id: str | None = None) -> dict:
-    logger.info(f"Token refresh requested for {store_key}")
+def _refresh_store_token(shop_key: str, store: dict, user_id: str | None = None) -> dict:
+    """Refresh token and save updated store to Supabase."""
+    logger.info(f"Refreshing token for {shop_key}...")
     try:
         r = requests.post(
             f"https://{store['shop']}/admin/oauth/access_token",
             data={
-                "client_id": store.get("api_key"),
+                "client_id":     store.get("api_key"),
                 "client_secret": store.get("api_secret"),
-                "grant_type": "client_credentials",
+                "grant_type":    "client_credentials",
             },
             timeout=10,
         )
-        r.raise_for_status()
-        token_data = r.json()
-        store["access_token"] = token_data.get("access_token")
-        store["token_expires_at"] = time.time() + token_data.get("expires_in", 3600)
-        stores[store_key] = store
-        save_stores(stores, user_id=user_id)
-        logger.info(f"Token refreshed for {store_key}")
+        if r.status_code == 200:
+            data = r.json()
+            store["access_token"]     = data.get("access_token")
+            store["token_expires_at"] = time.time() + data.get("expires_in", 3600)
+            save_single_store(shop_key, store, user_id=user_id)
+            logger.info(f"✅ Token refreshed for {shop_key}")
     except Exception as e:
-        logger.warning(f"Token refresh failed for {store_key}: {e}")
+        logger.warning(f"Token refresh failed for {shop_key}: {e}")
     return store
 
 
-def _get_store_record(
-    shop_key: str | None = None,
-    force_refresh: bool = False,
-    user_id: str | None = None,
-) -> tuple[str | None, dict | None]:
-    try:
-        resolved_user_id = user_id or get_request_user_id()
-        if not resolved_user_id:
-            return None, None
+# ── Main helpers ──────────────────────────────────────────────────────────────
 
-        stores = load_stores(resolved_user_id)
-        if not stores:
-            return None, None
-
-        resolved_key = shop_key or get_active_store_key(resolved_user_id)
-        if not resolved_key or resolved_key not in stores:
-            return None, None
-
-        store = stores[resolved_key]
-        token_expires_at = store.get("token_expires_at", 0)
-        should_refresh = force_refresh or (
-            token_expires_at and time.time() > token_expires_at - TOKEN_REFRESH_WINDOW_SECONDS
-        )
-
-        if should_refresh:
-            store = _refresh_store_token(stores, resolved_key, store, user_id=resolved_user_id)
-
-        return resolved_key, store
-    except Exception as e:
-        logger.error(f"Error loading store: {e}")
-        return None, None
-
-def get_connected_store(user_id: str | None = None) -> dict | None:
-    """Return the active store dict, auto-refreshing the token if it's about to expire."""
-    _, store = _get_store_record(user_id=user_id)
-    return store
-
-
-def get_store_access_token(
-    shop_key: str | None = None,
-    force_refresh: bool = False,
-    user_id: str | None = None,
-) -> str | None:
-    _, store = _get_store_record(shop_key=shop_key, force_refresh=force_refresh, user_id=user_id)
-    if not store:
+def get_connected_store(shop_key: str | None = None, user_id: str | None = None) -> dict | None:
+    """Return active store dict, auto-refreshing token if expiring soon."""
+    resolved = user_id or get_request_user_id()
+    if not resolved:
         return None
-    return store.get("access_token")
+    try:
+        stores    = load_stores(resolved)
+        if not stores:
+            return None
+        store_key = shop_key or get_active_store_key(resolved)
+        if not store_key or store_key not in stores:
+            return None
+        store = stores[store_key]
+        # Auto-refresh if expiring within 5 minutes
+        expires = store.get("token_expires_at", 0)
+        if expires and time.time() > expires - TOKEN_REFRESH_WINDOW_SECONDS:
+            store = _refresh_store_token(store_key, store, user_id=resolved)
+        return store
+    except Exception as e:
+        logger.error(f"get_connected_store error: {e}")
+        return None
 
 
 def get_shopify_client(shop_key: str | None = None, user_id: str | None = None):
-    """Return a ShopifyClient initialised with the selected store's credentials."""
+    """Return ShopifyClient initialised with active store credentials."""
     from shopify_client import ShopifyClient
 
-    resolved_user_id = user_id or get_request_user_id()
-    if not resolved_user_id:
+    resolved = user_id or get_request_user_id()
+    if not resolved:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    resolved_key, store = _get_store_record(shop_key=shop_key, user_id=resolved_user_id)
+    store = get_connected_store(shop_key=shop_key, user_id=resolved)
     if not store:
         raise HTTPException(
             status_code=400,
@@ -288,12 +277,40 @@ def get_shopify_client(shop_key: str | None = None, user_id: str | None = None):
             shop_name=shop_name,
             access_token=access_token,
             api_version=api_version,
-            token_refresh_callback=lambda: get_store_access_token(
-                resolved_key,
-                force_refresh=True,
-                user_id=resolved_user_id,
-            ),
         )
     except Exception as e:
-        logger.error(f"Error initialising ShopifyClient: {e}")
+        logger.error(f"ShopifyClient init error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to initialise Shopify client: {str(e)}")
+
+
+def get_store_access_token(
+    shop_key: str | None = None,
+    force_refresh: bool = False,
+    user_id: str | None = None,
+) -> str | None:
+    """Get access token for a store, optionally forcing refresh."""
+    resolved = user_id or get_request_user_id()
+    store    = get_connected_store(shop_key=shop_key, user_id=resolved)
+    if not store:
+        return None
+    if force_refresh:
+        active_key = shop_key or get_active_store_key(resolved)
+        if active_key:
+            store = _refresh_store_token(active_key, store, user_id=resolved)
+    return store.get("access_token")
+
+
+def load_all_user_stores() -> dict[str, dict]:
+    """Load all stores across all users (admin/background tasks only)."""
+    try:
+        result = _get_supabase().table("connected_stores").select("*").execute()
+        all_stores: dict[str, dict] = {}
+        for row in (result.data or []):
+            uid      = row.get("user_id")
+            shop_key = row.get("shop_key")
+            if uid and shop_key:
+                all_stores.setdefault(uid, {})[shop_key] = _row_to_store(row)
+        return all_stores
+    except Exception as e:
+        logger.error(f"load_all_user_stores error: {e}")
+        return {}
