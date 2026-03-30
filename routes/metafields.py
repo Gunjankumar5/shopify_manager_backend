@@ -40,9 +40,12 @@ def get_metafield_definitions(
             detail=f"Invalid owner_type. Use: {', '.join(OWNER_TYPE_MAP.keys())}",
         )
     try:
-        return get_shopify_client().get_metafield_definitions(gql_type)
+        logger.info(f"Fetching metafield definitions for {owner_type} (gql_type={gql_type})")
+        result = get_shopify_client().get_metafield_definitions(gql_type)
+        logger.info(f"Successfully fetched {len(result.get('definitions', []))} definitions")
+        return result
     except Exception as e:
-        logger.error(f"Error fetching metafield definitions: {e}")
+        logger.error(f"Error fetching metafield definitions: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -79,10 +82,20 @@ def create_metafield(
     if missing:
         raise HTTPException(status_code=400, detail=f"Missing fields: {', '.join(missing)}")
     try:
-        return get_shopify_client().create_metafield(resource, resource_id, data)
+        logger.info(f"Creating metafield for {resource}/{resource_id}: {data}")
+        result = get_shopify_client().create_metafield(resource, resource_id, data)
+        logger.info(f"Metafield created successfully: {result}")
+        return result
     except Exception as e:
-        logger.error(f"Error creating metafield: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        error_msg = str(e)
+        logger.error(f"Error creating metafield: {error_msg}")
+        # If it's a 422 error from Shopify, it's a validation issue
+        if "422" in error_msg:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Shopify validation error: {error_msg}. Check that the value is in the correct format for this field type.",
+            )
+        raise HTTPException(status_code=400, detail=error_msg)
 
 
 # ── Update ────────────────────────────────────────────────────────────────────

@@ -912,14 +912,42 @@ class ShopifyClient:
         return {"metafields": all_metafields}
 
     def create_metafield(self, resource: str, resource_id: int, data: dict) -> dict:
-        r = self._request(
-            "POST",
-            f"{self._get_base_url()}/{resource}/{resource_id}/metafields.json",
-            json={"metafield": data},
-            timeout=30,
-        )
-        r.raise_for_status()
-        return r.json()
+        import logging as _log
+        logger = _log.getLogger(__name__)
+        logger.info(f"Creating metafield for {resource}/{resource_id}: {data}")
+        
+        # The data dict should contain: namespace, key, type, value
+        # Shopify REST API requires this specific format
+        payload = {
+            "metafield": {
+                "namespace": data.get("namespace", "custom"),
+                "key": data.get("key"),
+                "type": data.get("type"),
+                "value": data.get("value", ""),
+            }
+        }
+        logger.info(f"Payload being sent to Shopify: {payload}")
+        
+        try:
+            r = self._request(
+                "POST",
+                f"{self._get_base_url()}/{resource}/{resource_id}/metafields.json",
+                json=payload,
+                timeout=30,
+            )
+            if not r.ok:
+                error_body = r.text
+                logger.error(f"Shopify error ({r.status_code}): {error_body}")
+                try:
+                    error_json = r.json()
+                    raise Exception(f"Shopify {r.status_code}: {error_json}")
+                except:
+                    raise Exception(f"Shopify {r.status_code}: {error_body}")
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            logger.error(f"Error creating metafield: {e}")
+            raise
 
     def update_metafield(self, metafield_id: int, data: dict) -> dict:
         r = self._request(
@@ -951,18 +979,39 @@ class ShopifyClient:
                         key
                         name
                         description
-                        type { name category }
-                        validations { name type value }
-                        visibleToStorefrontApi
-                        pinnedPosition
+                        type {
+                            name
+                        }
+                        validations {
+                            name
+                            type
+                            value
+                        }
                     }
+                }
+                pageInfo {
+                    hasNextPage
+                    endCursor
                 }
             }
         }
         """
-        result = self.graphql(query, {"ownerType": owner_type, "first": 250})
-        definitions = [
-            edge["node"]
-            for edge in result.get("metafieldDefinitions", {}).get("edges", [])
-        ]
-        return {"definitions": definitions}
+        try:
+            import logging as _log
+            logger = _log.getLogger(__name__)
+            logger.info(f"Fetching metafield definitions for owner_type: {owner_type}")
+            
+            result = self.graphql(query, {"ownerType": owner_type, "first": 250})
+            logger.info(f"GraphQL result for metafield definitions: {result}")
+            
+            definitions = [
+                edge["node"]
+                for edge in result.get("metafieldDefinitions", {}).get("edges", [])
+            ]
+            logger.info(f"Extracted {len(definitions)} definitions")
+            return {"definitions": definitions}
+        except Exception as e:
+            import logging as _log
+            logger = _log.getLogger(__name__)
+            logger.error(f"Error in get_metafield_definitions: {e}", exc_info=True)
+            raise
