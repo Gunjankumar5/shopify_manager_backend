@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from starlette.requests import Request
 from starlette.types import ASGIApp, Receive, Scope, Send
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from pathlib import Path
@@ -112,6 +113,9 @@ app = FastAPI(
     redirect_slashes=False,
     lifespan=lifespan,
 )
+
+# Compress responses to reduce bandwidth for large JSON payloads
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 app.add_middleware(
     CORSMiddleware,

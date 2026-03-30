@@ -370,6 +370,13 @@ def _enrich_product_for_editor(shopify, product: Dict[str, Any]) -> Dict[str, An
     except Exception:
         enriched["seo"] = {"title": "", "description": ""}
 
+    # ── FETCH METAFIELDS ───────────────────────────────────────────────
+    try:
+        mf_result = shopify._get(f"/products/{product_id}/metafields.json")
+        enriched["metafields"] = mf_result.get("metafields", [])
+    except Exception:
+        enriched["metafields"] = []
+
     variants = enriched.get("variants") or []
     if variants:
         inventory_item_id = variants[0].get("inventory_item_id")
@@ -698,6 +705,44 @@ def create_product(product_data: dict):
         product = result.get("product") if isinstance(result, dict) else None
         if isinstance(product, dict):
             _apply_post_product_updates(shopify, product, product_data)
+            # Persist provided metafields (if any)
+            try:
+                mfs = product_data.get("metafields") or []
+                if isinstance(mfs, list) and mfs:
+                    def _to_int_id(x):
+                        try:
+                            return int(x)
+                        except Exception:
+                            import re
+                            s = str(x or "")
+                            m = re.search(r"(\d+)$", s)
+                            return int(m.group(1)) if m else None
+
+                    for mf in mfs:
+                        if not isinstance(mf, dict):
+                            continue
+                        mf_payload = {
+                            "namespace": mf.get("namespace", "custom"),
+                            "key": mf.get("key"),
+                            "type": mf.get("type", mf.get("value_type", "single_line_text_field")),
+                            "value": mf.get("value", ""),
+                        }
+                        try:
+                            rid = _to_int_id(product.get("id"))
+                            if rid is not None:
+                                shopify.create_metafield("products", rid, mf_payload)
+                        except Exception:
+                            # best-effort, don't fail the whole request
+                            pass
+                    # Invalidate metafield defs/cache after writes
+                    try:
+                        from routes.metafields import _cache_lock, _metafields_cache
+                        with _cache_lock:
+                            _metafields_cache.clear()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             result["product"] = _enrich_product_for_editor(shopify, product)
         _cache_invalidate_for_current_user()
         return result
@@ -716,6 +761,42 @@ def update_product(product_id: int, product_data: dict):
         product = result.get("product") if isinstance(result, dict) else None
         if isinstance(product, dict):
             _apply_post_product_updates(shopify, product, product_data)
+            # Persist provided metafields (if any)
+            try:
+                mfs = product_data.get("metafields") or []
+                if isinstance(mfs, list) and mfs:
+                    for mf in mfs:
+                        if not isinstance(mf, dict):
+                            continue
+                        try:
+                            if mf.get("id") is not None:
+                                try:
+                                    import re
+                                    s = str(mf.get("id"))
+                                    m = re.search(r"(\d+)$", s)
+                                    mid = int(m.group(1)) if m else None
+                                    if mid is not None:
+                                        shopify.update_metafield(mid, {"value": mf.get("value", "")})
+                                except Exception:
+                                    pass
+                            else:
+                                mf_payload = {
+                                    "namespace": mf.get("namespace", "custom"),
+                                    "key": mf.get("key"),
+                                    "type": mf.get("type", mf.get("value_type", "single_line_text_field")),
+                                    "value": mf.get("value", ""),
+                                }
+                                shopify.create_metafield("products", product_id, mf_payload)
+                        except Exception:
+                            pass
+                    try:
+                        from routes.metafields import _cache_lock, _metafields_cache
+                        with _cache_lock:
+                            _metafields_cache.clear()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             refreshed = shopify.get_product(product_id)
             refreshed_product = refreshed.get("product") if isinstance(refreshed, dict) else None
             if isinstance(refreshed_product, dict):

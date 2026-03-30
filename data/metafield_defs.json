@@ -50,6 +50,30 @@
       "min": null,
       "max": null,
       "regex": null
+    },
+    "custom.blah": {
+      "name": "BLAH",
+      "type": "single_line_text_field",
+      "choices": [
+        "1",
+        "2",
+        "2.2"
+      ],
+      "min": null,
+      "max": null,
+      "regex": null
+    },
+    "custom.dfg": {
+      "name": "dfg",
+      "type": "single_line_text_field",
+      "choices": [
+        "8",
+        "9",
+        "0"
+      ],
+      "min": null,
+      "max": null,
+      "regex": null
     }
   },
   "variant": {}

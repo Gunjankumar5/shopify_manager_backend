@@ -24,6 +24,17 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Re
 from fastapi.responses import Response
 
 from services.bulk_fetch import BulkFetchService
+import os
+import threading
+import time as _time
+
+# Simple in-memory cache for export JSON to avoid re-running bulk op repeatedly
+_export_cache = {
+    "data": None,
+    "ts": 0,
+}
+_export_lock = threading.Lock()
+_EXPORT_TTL_SECONDS = 300  # 5 minutes
 from services.sync_bridge import (
     get_queue, pop_queue, remove_queue, run_sync, DONE_SENTINEL
 )
@@ -53,13 +64,65 @@ def export_excel():
 # ── JSON load (rows + snapshot) ───────────────────────────────────────────────
 
 @router.get("/json", summary="Load products as JSON rows + snapshot for sync")
-def export_json():
+def export_json(request: Request):
+    """
+    Returns:
+      rows      — grid data
+      snapshot  — for sync delta detection
+      choice_map — { "Metafield Name": ["choice1", "choice2"] } for dropdown cells
+    """
+
+
+    # Allow enabling a local dev sample via env var or query param `?dev_sample=1`
+    q = str(request.query_params.get("dev_sample", "")).lower()
+    dev_sample = q in ("1", "true", "yes") or str(os.getenv("DEV_EXPORT_SAMPLE", "")).lower() in ("1", "true", "yes")
+    # Also allow localhost requests to use dev sample when no store is connected,
+    # but only if ALLOW_DEV_SHORTCUTS env var is enabled (opt-in).
     try:
-        service = BulkFetchService()
-        rows, snapshot = service.full_sync()
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        allow_dev = str(os.getenv("ALLOW_DEV_SHORTCUTS", "")).lower() in ("1", "true", "yes")
+        client_host = getattr(request.client, "host", "") or ""
+        if not dev_sample and allow_dev and client_host in ("127.0.0.1", "::1", "localhost"):
+            dev_sample = True
+    except Exception:
+        pass
+    # If developer explicitly requested a sample payload, skip the heavy bulk operation.
+    if dev_sample:
+        rows = [
+            {
+                "Product ID": "gid://shopify/Product/1001",
+                "Variant ID": "gid://shopify/ProductVariant/2001",
+                "Inventory Item ID": "3001",
+                "Handle": "sample-product",
+                "Title": "Sample Product",
+                "Vendor": "Acme",
+                "Type": "Sample",
+                "Variant Price": "19.99",
+            }
+        ]
+        snapshot = {
+            "gid://shopify/Product/1001": {
+                "id": "gid://shopify/Product/1001",
+                "title": "Sample Product",
+                "variants": [
+                    {"id": "gid://shopify/ProductVariant/2001", "inventory_item_id": "3001"}
+                ],
+            },
+                "__choice_map__": {
+                    # include choice_map keys that match the sample row headers
+                    "Type": ["Sample", "Demo", "Other"],
+                    "Vendor": ["Acme", "Acme Corp", "Acme Intl"]
+                },
+        }
+    else:
+        try:
+            service = BulkFetchService()
+            rows, snapshot = service.full_sync()
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # Extract choice_map from snapshot (added by bulk_fetch)
+    choice_map = snapshot.pop("__choice_map__", {})
 
     cleaned = [
         {k: ("" if v is None else v) for k, v in row.items()}
@@ -67,9 +130,10 @@ def export_json():
     ]
 
     return {
-        "rows": cleaned,
-        "snapshot": snapshot,
-        "count": len(cleaned),
+        "rows":       cleaned,
+        "snapshot":   snapshot,
+        "count":      len(cleaned),
+        "choice_map": choice_map,   # ← frontend uses this for dropdown cells
     }
 
 
