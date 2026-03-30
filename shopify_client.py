@@ -1,4 +1,6 @@
 import time
+import random
+import logging
 import requests
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import parse_qs, urlparse
@@ -6,7 +8,7 @@ import re
 
 
 class ShopifyClient:
-    def __init__(self, shop_name=None, access_token=None, api_version="2026-01", token_refresh_callback: Optional[Callable[[], Optional[str]]] = None):
+    def __init__(self, shop_name=None, access_token=None, api_version="2026-01", token_refresh_callback: Optional[Callable[[], Optional[str]]] = None, max_retries: int = 5, backoff_factor: float = 0.6):
         """Initialize Shopify client.
         
         Args:
@@ -18,6 +20,11 @@ class ShopifyClient:
         self.access_token = access_token
         self.api_version = api_version
         self.token_refresh_callback = token_refresh_callback
+        # HTTP session for connection pooling and performance
+        self.session = requests.Session()
+        self.max_retries = int(max_retries)
+        self.backoff_factor = float(backoff_factor)
+        self.logger = logging.getLogger("shopify_client")
 
         if not self.shop_name:
             raise ValueError("Missing shop_name. Connect a Shopify store before creating the client.")
@@ -41,16 +48,66 @@ class ShopifyClient:
         return True
 
     def _request(self, method: str, url: str, retry_on_unauthorized: bool = True, **kwargs):
+        """Perform an HTTP request with retries and backoff.
+
+        Preserves the same signature as before. Retries on 429 and 5xx responses,
+        and will attempt a single token refresh on 401 if a callback is provided.
+        """
         headers = {
             "Content-Type": "application/json",
             "X-Shopify-Access-Token": self.access_token,
             **(kwargs.pop("headers", {}) or {}),
         }
-        response = requests.request(method, url, headers=headers, **kwargs)
-        if response.status_code == 401 and retry_on_unauthorized and self._refresh_access_token():
-            headers["X-Shopify-Access-Token"] = self.access_token
-            response = requests.request(method, url, headers=headers, **kwargs)
-        return response
+
+        attempt = 0
+        last_exc = None
+        while True:
+            attempt += 1
+            try:
+                resp = self.session.request(method, url, headers=headers, **kwargs)
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt > self.max_retries:
+                    self.logger.exception("Request failed after retries: %s %s", method, url)
+                    raise
+                sleep = self.backoff_factor * (2 ** (attempt - 1)) * (0.8 + random.random() * 0.4)
+                time.sleep(sleep)
+                continue
+
+            # Unauthorized: try refreshing token once and retry immediately.
+            if resp.status_code == 401 and retry_on_unauthorized and self._refresh_access_token():
+                headers["X-Shopify-Access-Token"] = self.access_token
+                try:
+                    resp = self.session.request(method, url, headers=headers, **kwargs)
+                except requests.RequestException as exc:
+                    last_exc = exc
+                    if attempt > self.max_retries:
+                        raise
+                    sleep = self.backoff_factor * (2 ** (attempt - 1))
+                    time.sleep(sleep)
+                    continue
+
+            # Rate limited: respect Retry-After when present, otherwise exponential backoff
+            if resp.status_code == 429 and attempt <= self.max_retries:
+                retry_after = resp.headers.get("Retry-After")
+                try:
+                    wait = float(retry_after) if retry_after is not None else None
+                except Exception:
+                    wait = None
+                if wait is None:
+                    wait = self.backoff_factor * (2 ** (attempt - 1))
+                self.logger.warning("429 rate limited — waiting %.2fs (attempt %d) for %s", wait, attempt, url)
+                time.sleep(wait)
+                continue
+
+            # Server error: retry a few times
+            if 500 <= resp.status_code < 600 and attempt <= self.max_retries:
+                sleep = self.backoff_factor * (2 ** (attempt - 1))
+                self.logger.warning("Server error %s — retrying after %.2fs (attempt %d)", resp.status_code, sleep, attempt)
+                time.sleep(sleep)
+                continue
+
+            return resp
 
     # =========================================================
     # GRAPHQL
