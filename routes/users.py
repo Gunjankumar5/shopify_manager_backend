@@ -1,281 +1,521 @@
 """
-User management and permission system.
-
-Endpoints for creating, reading, updating, and deleting users with role-based permissions.
-Supports admin users creating junior users with granular permission controls.
+routes/users.py — Full User Management with Role-Based Access Control
+Your schema: users(id, email, full_name, role, is_active, created_at, last_login, avatar_url)
+           + user_permissions(user_id, manage_products, delete_products, ...)
 """
-
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel, EmailStr
-from typing import Optional, List
-import logging
-import json
-from datetime import datetime
-from pathlib import Path
-
-from .auth_utils import require_authenticated_user
-from .user_utils import (
-    load_users,
-    save_users,
-    get_user,
-    create_user,
-    update_user,
-    delete_user,
-    get_user_role,
-    check_permission,
-    ADMIN_ROLE,
-    MANAGER_ROLE,
-    JUNIOR_ROLE,
-)
+from fastapi import APIRouter, HTTPException, Header
+from pydantic import BaseModel
+from typing import Optional
+import os, logging
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-
-class UserPermissions(BaseModel):
-    manage_products: bool = False
-    manage_collections: bool = False
-    manage_inventory: bool = False
-    manage_metafields: bool = False
-    manage_upload: bool = False
-    manage_export: bool = False
-    view_analytics: bool = False
+ALL_PERMISSIONS = [
+    "manage_products", "delete_products", "manage_collections",
+    "manage_inventory", "manage_metafields", "manage_upload",
+    "manage_export", "use_ai", "manage_stores", "manage_users",
+    "view_analytics",
+]
 
 
-class CreateJuniorUserRequest(BaseModel):
+# ── Supabase helpers ──────────────────────────────────────────────────────────
+
+def _get_supabase_admin():
+    from supabase import create_client
+    url = os.getenv("SUPABASE_URL", "").strip()
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+    if not url or not key:
+        raise HTTPException(503, "Supabase not configured")
+    return create_client(url, key)
+
+
+def _get_supabase_anon():
+    from supabase import create_client
+    url = os.getenv("SUPABASE_URL", "").strip()
+    key = os.getenv("SUPABASE_ANON_KEY", "").strip()
+    if not url or not key:
+        raise HTTPException(503, "Supabase not configured")
+    return create_client(url, key)
+
+
+# ── Auth: extract user_id from Bearer token ───────────────────────────────────
+
+def get_current_user_id(authorization: str = Header(None)) -> str:
+    """Extract user UUID from Bearer token via Supabase auth."""
+    logger.info(f"[get_current_user_id] Authorization header received: {'YES' if authorization else 'NO'}")
+    if not authorization or not authorization.startswith("Bearer "):
+        logger.error("[get_current_user_id] Missing or invalid Authorization header")
+        raise HTTPException(401, "Missing or invalid Authorization header")
+    token = authorization.split(" ", 1)[1]
+    logger.info(f"[get_current_user_id] Token extracted: {token[:20]}...")
+    try:
+        sb = _get_supabase_anon()
+        resp = sb.auth.get_user(token)
+        if not resp or not resp.user:
+            logger.error("[get_current_user_id] No user in response")
+            raise HTTPException(401, "Invalid or expired token")
+        logger.info(f"[get_current_user_id] User authenticated: {resp.user.id}")
+        return str(resp.user.id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[get_current_user_id] Auth error: {e}")
+        raise HTTPException(401, "Authentication failed")
+
+
+def get_current_user_full(authorization: str = Header(None)) -> dict:
+    """Returns full user dict including role and permissions. Auto-creates user if missing."""
+    try:
+        user_id = get_current_user_id(authorization)
+        logger.info(f"[get_current_user_full] Authenticated user: {user_id}")
+    except HTTPException as e:
+        logger.error(f"[get_current_user_full] Auth failed: {e.detail}")
+        raise
+    
+    sb = _get_supabase_admin()
+    try:
+        # Query users table: 'id' is the primary key (NOT user_id)
+        r = sb.table("users").select(
+            "id, email, full_name, role, is_active, created_at, last_login"
+        ).eq("id", user_id).execute()
+        
+        user_data = r.data[0] if r.data else None
+        
+        # If user doesn't exist, create it from auth data
+        if not user_data:
+            logger.info(f"[AUTO-CREATE] User {user_id} not found, creating from auth data...")
+            try:
+                # Get auth user data
+                token = authorization.split(" ", 1)[1]
+                auth_resp = _get_supabase_anon().auth.get_user(token)
+                if not auth_resp or not auth_resp.user:
+                    raise HTTPException(401, "Cannot extract auth response")
+                auth_user = auth_resp.user
+                if not auth_user or not auth_user.email:
+                    raise HTTPException(401, "Cannot extract email from auth token")
+                
+                # Create user record with defaults
+                full_name = auth_user.user_metadata.get("full_name", auth_user.email.split("@")[0]) if auth_user.user_metadata else auth_user.email.split("@")[0]
+                
+                create_resp = sb.table("users").insert({
+                    "id": user_id,
+                    "email": auth_user.email,
+                    "full_name": full_name,
+                    "role": "junior",
+                    "is_active": True,
+                }).execute()
+                
+                if create_resp.data:
+                    user_data = create_resp.data[0]
+                    logger.info(f"[AUTO-CREATE] ✓ Created user {user_id} ({auth_user.email})")
+                else:
+                    raise Exception("Failed to insert user record")
+            except Exception as create_error:
+                logger.error(f"[AUTO-CREATE] Failed: {create_error}")
+                raise HTTPException(500, f"Failed to create user profile: {create_error}")
+        
+        user: dict = user_data  # type: ignore
+        user["user_id"] = user.get("id")  # Alias for frontend consistency
+        logger.info(f"[get_current_user_full] User loaded: {user.get('email')} (role: {user.get('role')})")
+        
+        # Fetch permissions using user_id foreign key
+        p = sb.table("user_permissions").select("*").eq("user_id", user_id).execute()
+        if p.data and len(p.data) > 0:
+            perm_data = p.data[0]
+            user["permissions"] = perm_data  # type: ignore
+        else:
+            logger.info(f"[AUTO-CREATE] Permissions missing for {user_id}, creating...")
+            try:
+                # Create default permissions row
+                sb.table("user_permissions").insert({
+                    "user_id": user_id,
+                    "manage_products": False,
+                    "delete_products": False,
+                    "manage_collections": False,
+                    "manage_inventory": False,
+                    "manage_metafields": False,
+                    "manage_upload": False,
+                    "manage_export": False,
+                    "use_ai": False,
+                    "manage_stores": False,
+                    "manage_users": False,
+                    "view_analytics": False,
+                }).execute()
+                user["permissions"] = {k: False for k in ALL_PERMISSIONS}
+                logger.info(f"[AUTO-CREATE] ✓ Created permissions for {user_id}")
+            except Exception as perm_error:
+                logger.warning(f"[AUTO-CREATE] Could not create permissions: {perm_error}")
+                user["permissions"] = {k: False for k in ALL_PERMISSIONS}
+        
+        perms = user.get("permissions", {})
+        perm_keys = list(perms.keys()) if isinstance(perms, dict) else []
+        logger.info(f"[get_current_user_full] Permissions: {perm_keys}")
+        return user
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[get_current_user_full] Database error: {e}")
+        raise HTTPException(500, str(e))
+
+
+def require_admin(authorization: str = Header(None)) -> dict:
+    user = get_current_user_full(authorization)
+    if user.get("role") != "admin":
+        raise HTTPException(403, "Admin access required")
+    return user
+
+
+def require_admin_or_manager(authorization: str = Header(None)) -> dict:
+    user = get_current_user_full(authorization)
+    if user.get("role") not in ("admin", "manager"):
+        raise HTTPException(403, "Admin or Manager access required")
+    return user
+
+
+# ── Pydantic models ───────────────────────────────────────────────────────────
+
+class CreateUserBody(BaseModel):
     email: str
     full_name: str
-    role: str = JUNIOR_ROLE  # "junior", "manager"
-    permissions: Optional[UserPermissions] = None
-    password: str = ""  # For backend-only user creation
+    role: str = "junior"                        # admin | manager | junior
+    permissions: Optional[dict] = {}
+    password: Optional[str] = None              # if None, magic link is sent
 
 
-class UpdateUserRequest(BaseModel):
-    full_name: Optional[str] = None
-    role: Optional[str] = None
-    permissions: Optional[UserPermissions] = None
-    is_active: Optional[bool] = None
+class UpdatePermissionsBody(BaseModel):
+    permissions: dict                           # {permission_key: bool}
 
 
-class UserResponse(BaseModel):
-    user_id: str
-    email: str
-    full_name: str
-    role: str
-    permissions: UserPermissions
-    is_active: bool
-    created_at: str
-    last_login: Optional[str] = None
+class UpdateRoleBody(BaseModel):
+    role: str                                   # admin | manager | junior
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
 
-@router.get("/")
-def list_users(
-    current_user_id: str = Depends(require_authenticated_user),
-) -> dict:
-    """List all users (admin/manager only)."""
-    # Check if current user has permission
-    current_user = get_user(current_user_id)
-    if not current_user:
-        raise HTTPException(status_code=401, detail="User not found")
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
-    if not check_permission(current_user_id, "manage_users"):
-        raise HTTPException(status_code=403, detail="Permission denied. Only admins can manage users.")
-
-    users = load_users()
-    users_list = []
-
-    for user_id, user_data in users.items():
-        if user_id == "__legacy__":
-            continue
-        users_list.append({
-            "user_id": user_id,
-            "email": user_data.get("email", ""),
-            "full_name": user_data.get("full_name", ""),
-            "role": user_data.get("role", JUNIOR_ROLE),
-            "is_active": user_data.get("is_active", True),
-            "created_at": user_data.get("created_at"),
-            "last_login": user_data.get("last_login"),
-            "permissions": user_data.get("permissions", {}),
-        })
-
-    return {
-        "success": True,
-        "users": users_list,
-        "count": len(users_list),
-    }
-
-
-@router.post("/create-junior")
-def create_junior_user(
-    req: CreateJuniorUserRequest,
-    current_user_id: str = Depends(require_authenticated_user),
-) -> dict:
-    """Create a new junior user (admin/manager only)."""
-    current_user = get_user(current_user_id)
-    if not current_user:
-        raise HTTPException(status_code=401, detail="User not found")
-
-    if not check_permission(current_user_id, "manage_users"):
-        raise HTTPException(status_code=403, detail="Permission denied. Only admins can create users.")
-
-    # Check if user already exists
-    users = load_users()
-    if any(u.get("email") == req.email.lower() for u in users.values() if u):
-        raise HTTPException(status_code=400, detail="User with this email already exists")
-
-    # Create the user
-    user_id = create_user(
-        email=req.email.lower(),
-        full_name=req.full_name,
-        role=req.role,
-        permissions=req.permissions or UserPermissions(),
-    )
-
-    new_user = get_user(user_id)
-    return {
-        "success": True,
-        "message": f"Junior user '{req.email}' created successfully",
-        "user": {
-            "user_id": user_id,
-            "email": new_user.get("email"),
-            "full_name": new_user.get("full_name"),
-            "role": new_user.get("role"),
-            "permissions": new_user.get("permissions"),
-            "created_at": new_user.get("created_at"),
-        },
-    }
-
-
-@router.get("/{user_id}")
-def get_user_info(
-    user_id: str,
-    current_user_id: str = Depends(require_authenticated_user),
-) -> dict:
-    """Get user info (admin/manager or self)."""
-    # Allow users to view their own info, or admins to view any user
-    if user_id != current_user_id:
-        if not check_permission(current_user_id, "manage_users"):
-            raise HTTPException(status_code=403, detail="Permission denied")
-
-    user = get_user(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    return {
-        "success": True,
-        "user": {
-            "user_id": user_id,
-            "email": user.get("email"),
-            "full_name": user.get("full_name"),
-            "role": user.get("role"),
-            "permissions": user.get("permissions", {}),
-            "is_active": user.get("is_active", True),
-            "created_at": user.get("created_at"),
-            "last_login": user.get("last_login"),
-        },
-    }
-
-
-@router.put("/{user_id}")
-def update_user_info(
-    user_id: str,
-    req: UpdateUserRequest,
-    current_user_id: str = Depends(require_authenticated_user),
-) -> dict:
-    """Update user info (admin/manager or self, with limitations)."""
-    user = get_user(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # Check permissions
-    is_self = user_id == current_user_id
-    is_admin = check_permission(current_user_id, "manage_users")
-
-    if not is_self and not is_admin:
-        raise HTTPException(status_code=403, detail="Permission denied")
-
-    # Users can't change their own role
-    if is_self and req.role and req.role != user.get("role"):
-        raise HTTPException(status_code=403, detail="Cannot change your own role")
-
-    # Users can't change their own permissions
-    if is_self and req.permissions:
-        raise HTTPException(status_code=403, detail="Cannot change your own permissions")
-
-    # Update the user
-    updated_user = update_user(user_id, req)
-
-    return {
-        "success": True,
-        "message": "User updated successfully",
-        "user": {
-            "user_id": user_id,
-            "email": updated_user.get("email"),
-            "full_name": updated_user.get("full_name"),
-            "role": updated_user.get("role"),
-            "permissions": updated_user.get("permissions"),
-            "is_active": updated_user.get("is_active"),
-        },
-    }
-
-
-@router.delete("/{user_id}")
-def deactivate_user(
-    user_id: str,
-    current_user_id: str = Depends(require_authenticated_user),
-) -> dict:
-    """Deactivate a user (admin only)."""
-    if not check_permission(current_user_id, "manage_users"):
-        raise HTTPException(status_code=403, detail="Permission denied. Only admins can delete users.")
-
-    if user_id == current_user_id:
-        raise HTTPException(status_code=400, detail="Cannot deactivate your own account")
-
-    user = get_user(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    delete_user(user_id)
-
-    return {
-        "success": True,
-        "message": f"User {user.get('email')} has been deactivated",
-    }
-
-
-@router.post("/update-last-login/{user_id}")
-def log_last_login(
-    user_id: str,
-    current_user_id: str = Depends(require_authenticated_user),
-) -> dict:
-    """Update last login timestamp (internal, self only)."""
-    if user_id != current_user_id:
-        raise HTTPException(status_code=403, detail="Can only update own last login")
-
-    users = load_users()
-    if user_id not in users:
-        users[user_id] = {}
-
-    users[user_id]["last_login"] = datetime.utcnow().isoformat() + "Z"
-    save_users(users)
-
-    return {"success": True}
+@router.get("/me")
+def get_me(authorization: str = Header(None)):
+    """Get current user's profile + permissions."""
+    try:
+        user = get_current_user_full(authorization)
+        logger.info(f"[GET /me] User {user.get('id')} loaded successfully")
+        return user
+    except Exception as e:
+        logger.error(f"[GET /me] Error: {e}")
+        raise
 
 
 @router.get("/me/permissions")
-def get_current_user_permissions(
-    current_user_id: str = Depends(require_authenticated_user),
-) -> dict:
-    """Get current user's permissions."""
-    user = get_user(current_user_id)
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
-
+def get_my_permissions(authorization: str = Header(None)):
+    """Shortcut: just the permissions + role (used by frontend for gating)."""
+    user = get_current_user_full(authorization)
     return {
-        "success": True,
-        "user_id": current_user_id,
-        "role": user.get("role", JUNIOR_ROLE),
+        "role":        user.get("role"),
+        "is_active":   user.get("is_active"),
         "permissions": user.get("permissions", {}),
     }
+
+
+@router.get("/")
+def list_users(authorization: str = Header(None)):
+    """List all users (admin/manager only)."""
+    logger.info("[GET /users/] Request received")
+    caller = require_admin_or_manager(authorization)
+    logger.info(f"[GET /users/] Caller authorized: {caller.get('id')} role={caller.get('role')}")
+    sb = _get_supabase_admin()
+    try:
+        r = sb.table("users").select(
+            "id, email, full_name, role, is_active, created_at, last_login"
+        ).order("created_at", desc=False).execute()
+        
+        users: list[dict] = r.data or []  # type: ignore
+        # Add user_id alias and attach permissions
+        perm_r = sb.table("user_permissions").select("*").execute()
+        perm_map: dict[str, dict] = {}  # type: ignore
+        for p in (perm_r.data or []):
+            p_dict: dict = p  # type: ignore
+            uid: str | None = p_dict.get("user_id")
+            if uid:
+                perm_map[uid] = p_dict
+        
+        for u in users:
+            u_dict: dict = u  # type: ignore
+            user_id_val = u_dict.get("id")
+            u_dict["user_id"] = user_id_val
+            if user_id_val:
+                u_dict["permissions"] = perm_map.get(user_id_val, {})  # type: ignore
+        
+        logger.info(f"[GET /users/] Returning {len(users)} users")
+        return {"users": users, "total": len(users)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[GET /users/] Error: {e}")
+        raise HTTPException(500, str(e))
+
+
+@router.post("/create-junior")
+def create_user(body: CreateUserBody, authorization: str = Header(None)):
+    """Create a new user. Admin can create any role; manager can only create junior."""
+    caller = require_admin_or_manager(authorization)
+    
+    # Managers can only create junior users
+    if caller["role"] == "manager" and body.role != "junior":
+        raise HTTPException(403, "Managers can only create junior users")
+
+    if body.role not in ("admin", "manager", "junior"):
+        raise HTTPException(400, "role must be admin, manager, or junior")
+
+    sb = _get_supabase_admin()
+
+    # 1. Create auth user
+    try:
+        auth_data: dict = {  # type: ignore
+            "email":         body.email,
+            "email_confirm": True,
+            "user_metadata": {"full_name": body.full_name},
+        }
+        if body.password:
+            auth_data["password"] = body.password
+        
+        auth_resp = sb.auth.admin.create_user(auth_data)  # type: ignore
+        new_user_id = str(auth_resp.user.id)
+    except Exception as e:
+        msg = str(e).lower()
+        if "already" in msg or "registered" in msg:
+            raise HTTPException(400, "A user with this email already exists")
+        raise HTTPException(400, f"Failed to create auth user: {str(e)}")
+
+    # 2. Upsert users row (trigger may have already created it)
+    try:
+        sb.table("users").upsert({
+            "id":         new_user_id,
+            "email":      body.email,
+            "full_name":  body.full_name,
+            "role":       body.role,
+            "is_active":  True,
+            "created_by": caller["id"],
+        }, on_conflict="id").execute()
+    except Exception as e:
+        raise HTTPException(500, f"Failed to save user profile: {str(e)}")
+
+    # 3. Build permissions
+    if body.role == "admin":
+        perms = {k: True for k in ALL_PERMISSIONS}
+    elif body.role == "manager":
+        perms = {k: True for k in ALL_PERMISSIONS if k != "manage_users"}
+        perms["manage_users"] = False
+    else:
+        # Junior: only explicitly granted permissions
+        body_perms = body.permissions or {}
+        perms = {k: bool(body_perms.get(k, False)) for k in ALL_PERMISSIONS}
+
+    try:
+        sb.table("user_permissions").upsert(
+            {"user_id": new_user_id, **perms},
+            on_conflict="user_id"
+        ).execute()
+    except Exception as e:
+        raise HTTPException(500, f"Failed to save permissions: {str(e)}")
+
+    # 4. Send password-reset email for magic link signup
+    if not body.password:
+        try:
+            sb.auth.admin.generate_link({
+                "type":  "recovery",
+                "email": body.email,
+            })
+        except Exception:
+            pass  # non-fatal
+
+    return {
+        "user_id":   new_user_id,
+        "email":     body.email,
+        "full_name": body.full_name,
+        "role":      body.role,
+        "created":   True,
+    }
+
+
+@router.put("/{user_id}/permissions")
+def update_permissions(
+    user_id: str,
+    body: UpdatePermissionsBody,
+    authorization: str = Header(None),
+):
+    """Update individual permission flags (admin only)."""
+    caller = require_admin(authorization)
+    if user_id == caller["id"]:
+        raise HTTPException(400, "Cannot edit your own permissions")
+
+    # Validate keys
+    invalid = [k for k in body.permissions if k not in ALL_PERMISSIONS]
+    if invalid:
+        raise HTTPException(400, f"Unknown permission keys: {invalid}")
+
+    sb = _get_supabase_admin()
+    try:
+        r = sb.table("user_permissions").select("*").eq("user_id", user_id).execute()
+        current = {}
+        if r.data and len(r.data) > 0:
+            current = r.data[0]  # type: ignore
+        current_dict = current if isinstance(current, dict) else {k: False for k in ALL_PERMISSIONS}
+        updated = {**current_dict, **{k: bool(v) for k, v in body.permissions.items()}}
+        updated["user_id"] = user_id
+        sb.table("user_permissions").upsert(updated, on_conflict="user_id").execute()
+        return {"updated": True, "permissions": updated}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.put("/me/role")
+def set_my_role(
+    body: UpdateRoleBody,
+    authorization: str = Header(None),
+):
+    """Allow user to set their own role on first-time registration."""
+    caller = get_current_user_full(authorization)
+    
+    # Allow role change if:
+    # 1. User has no role (null/None)
+    # 2. User has junior role (first-time setup)
+    current_role = caller.get("role")
+    if current_role and current_role not in ("junior", None):
+        # User already has a non-junior role assigned - admin must change it
+        raise HTTPException(403, "You already have a role assigned. Contact admin to change it.")
+    
+    if body.role not in ("admin", "manager", "junior"):
+        raise HTTPException(400, "role must be admin, manager, or junior")
+
+    sb = _get_supabase_admin()
+    try:
+        user_id = caller["id"]
+        sb.table("users").update({"role": body.role}).eq("id", user_id).execute()
+        
+        # Auto-adjust permissions based on role
+        if body.role == "manager":
+            perms: dict = {k: True for k in ALL_PERMISSIONS if k != "manage_users"}  # type: ignore
+            perms["manage_users"] = False
+            perms["user_id"] = user_id
+            sb.table("user_permissions").upsert(perms, on_conflict="user_id").execute()
+        elif body.role == "admin":
+            perms = {k: True for k in ALL_PERMISSIONS}  # type: ignore
+            perms["user_id"] = user_id
+            sb.table("user_permissions").upsert(perms, on_conflict="user_id").execute()
+        elif body.role == "junior":
+            # Keep existing junior permissions (all false by default)
+            pass
+        
+        logger.info(f"✅ User {user_id} set role to {body.role}")
+        return {"updated": True, "role": body.role}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error setting role: {e}")
+        raise HTTPException(500, str(e))
+
+
+@router.put("/{user_id}/role")
+def update_role(
+    user_id: str,
+    body: UpdateRoleBody,
+    authorization: str = Header(None),
+):
+    """Change another user's role (admin only)."""
+    caller = require_admin(authorization)
+    if user_id == caller["id"]:
+        raise HTTPException(400, "Use PUT /users/me/role to change your own role")
+    
+    if body.role not in ("admin", "manager", "junior"):
+        raise HTTPException(400, "role must be admin, manager, or junior")
+
+    sb = _get_supabase_admin()
+    try:
+        sb.table("users").update({"role": body.role}).eq("id", user_id).execute()
+        
+        # Auto-adjust permissions when promoting
+        if body.role == "manager":
+            perms: dict = {k: True for k in ALL_PERMISSIONS if k != "manage_users"}  # type: ignore
+            perms["manage_users"] = False
+            perms["user_id"] = user_id
+            sb.table("user_permissions").upsert(perms, on_conflict="user_id").execute()
+        elif body.role == "admin":
+            perms = {k: True for k in ALL_PERMISSIONS}  # type: ignore
+            perms["user_id"] = user_id
+            sb.table("user_permissions").upsert(perms, on_conflict="user_id").execute()
+        
+        return {"updated": True, "role": body.role}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.delete("/{user_id}")
+def deactivate_user(user_id: str, authorization: str = Header(None)):
+    """Deactivate (soft-delete) a user (admin only)."""
+    caller = require_admin(authorization)
+    if user_id == caller["id"]:
+        raise HTTPException(400, "Cannot deactivate yourself")
+
+    sb = _get_supabase_admin()
+    try:
+        sb.table("users").update({"is_active": False}).eq("id", user_id).execute()
+        # Also disable their Supabase Auth account
+        try:
+            sb.auth.admin.update_user_by_id(user_id, {"ban_duration": "876600h"})
+        except Exception:
+            pass  # best-effort
+        return {"deactivated": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.post("/{user_id}/reactivate")
+def reactivate_user(user_id: str, authorization: str = Header(None)):
+    """Reactivate a deactivated user (admin only)."""
+    require_admin(authorization)
+    sb = _get_supabase_admin()
+    try:
+        sb.table("users").update({"is_active": True}).eq("id", user_id).execute()
+        try:
+            sb.auth.admin.update_user_by_id(user_id, {"ban_duration": "none"})
+        except Exception:
+            pass
+        return {"reactivated": True}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.get("/{user_id}")
+def get_user(user_id: str, authorization: str = Header(None)):
+    """Get a single user's profile + permissions (admin/manager only)."""
+    require_admin_or_manager(authorization)
+    sb = _get_supabase_admin()
+    try:
+        r = sb.table("users").select(
+            "id, email, full_name, role, is_active, created_at, last_login"
+        ).eq("id", user_id).single().execute()
+        
+        if not r.data:
+            raise HTTPException(404, "User not found")
+        
+        user: dict = r.data  # type: ignore
+        user["user_id"] = user.get("id")
+        
+        p = sb.table("user_permissions").select("*").eq("user_id", user_id).execute()
+        if p.data and len(p.data) > 0:
+            perm_data = p.data[0]
+            user["permissions"] = perm_data  # type: ignore
+        else:
+            user["permissions"] = {}
+        return user
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))

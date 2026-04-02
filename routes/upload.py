@@ -13,48 +13,62 @@ router = APIRouter()
 PREVIEW_ROWS = 10
 
 def get_existing_products():
-    """Fetch ALL existing products from Shopify to check for duplicates"""
-    existing = {"titles": set(), "skus": set(), "handles": set()}
+    """Fetch ALL existing products from Shopify to check for duplicates.
+    
+    This is CRITICAL for duplicate detection. Raises exception if fetch fails.
+    """
+    existing = {"titles": set(), "skus": set(), "handles": set(), "product_ids": set()}
+    
     try:
         client = get_shopify_client()
-
+        print("🔍 [CRITICAL] Fetching ALL existing Shopify products for duplicate check...")
+        
         try:
-            try:
+            result = client.get_products(fetch_all=True)
+        except _requests.exceptions.HTTPError as http_err:
+            # Token expired mid-fetch — refresh and retry
+            if http_err.response is not None and http_err.response.status_code == 401:
+                print("🔄 [CRITICAL] Token expired while fetching existing products, refreshing...")
+                client = get_shopify_client()
                 result = client.get_products(fetch_all=True)
-            except _requests.exceptions.HTTPError as http_err:
-                # Token expired mid-fetch — refresh and retry
-                if http_err.response is not None and http_err.response.status_code == 401:
-                    print("🔄 Token expired while fetching existing products, refreshing...")
-                    client = get_shopify_client()
-                    result = client.get_products(fetch_all=True)
-                else:
-                    raise
-            products = result.get("products", [])
+            else:
+                raise
+        
+        products = result.get("products", [])
+        if not products:
+            print("⚠️ [WARNING] No products found in Shopify! Continuing with empty existing products set.")
+            print("📦 Existing products: 0 titles, 0 SKUs, 0 handles")
+            return existing
+        
+        for product in products:
+            product_id = product.get("id")
+            if product_id:
+                existing["product_ids"].add(str(product_id))
+            
+            title = (product.get("title") or "").lower().strip()
+            if title:
+                existing["titles"].add(title)
 
-            for product in products:
-                title = product.get("title", "").lower().strip()
-                if title:
-                    existing["titles"].add(title)
+            handle = (product.get("handle") or "").lower().strip()
+            if handle:
+                existing["handles"].add(handle)
 
-                handle = product.get("handle", "").lower().strip()
-                if handle:
-                    existing["handles"].add(handle)
+            for variant in product.get("variants", []):
+                sku = (variant.get("sku") or "").lower().strip()
+                if sku:
+                    existing["skus"].add(sku)
 
-                for variant in product.get("variants", []):
-                    sku = variant.get("sku", "").lower().strip()
-                    if sku:
-                        existing["skus"].add(sku)
-
-            print(f"✅ Fetched {len(products)} existing products for duplicate check")
-
-        except Exception as e:
-            print(f"⚠️ Error fetching products: {e}")
+        print(f"✅ SUCCESS: Fetched {len(products)} existing products")
+        print(f"📦 Existing products: {len(existing['titles'])} titles, {len(existing['skus'])} SKUs, {len(existing['handles'])} handles")
+        return existing
 
     except Exception as e:
-        print(f"⚠️ Could not fetch existing products: {e}")
-
-    print(f"📦 Total existing: {len(existing['titles'])} titles, {len(existing['skus'])} SKUs")
-    return existing
+        print(f"❌ [CRITICAL ERROR] Failed to fetch existing products: {e}")
+        print(f"❌ CANNOT PROCEED WITH UPLOAD - DUPLICATE CHECK FAILED!")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Critical error: Could not fetch existing products from Shopify. Duplicate check failed. Error: {str(e)}"
+        )
 
 
 def parse_file(content, filename, preview=False):
@@ -125,18 +139,32 @@ async def parse_full_file(file: UploadFile = File(...)):
 
 @router.post("/validate")
 async def validate_products(products: List[dict]):
+    """
+    Validate products before upload:
+    - Checks for required fields
+    - Detects duplicates in uploaded file
+    - Detects duplicates against existing Shopify products
+    """
     errors = []
     valid_count = 0
     duplicates = []
     existing_duplicates = []
 
-    existing_products = get_existing_products()
+    try:
+        existing_products = get_existing_products()
+    except HTTPException:
+        # get_existing_products() will raise HTTPException if it fails
+        # Let it bubble up so frontend sees the error
+        raise
+    
     seen_titles = set()
     seen_skus = set()
+    seen_handles = set()
 
     for i, product in enumerate(products):
         title = (product.get("title") or product.get("Title") or "").strip()
         sku = (product.get("sku") or product.get("Variant SKU") or "").strip()
+        handle = (product.get("handle") or product.get("Handle") or "").strip()
 
         has_data = any(
             str(v).strip() for k, v in product.items()
@@ -151,36 +179,64 @@ async def validate_products(products: List[dict]):
                 "message": f"Row {i + 1} has data but is missing a Title"
             })
         elif title:
-            title_lower = title.lower().strip()
+            title_lower = (title or "").lower().strip()
+            sku_lower = (sku or "").lower().strip() if sku else ""
+            handle_lower = (handle or "").lower().strip() if handle else ""
 
+            # Check for duplicate in uploaded file
             if title_lower in seen_titles:
-                duplicates.append({"row": i + 1, "title": title, "reason": "Duplicate in uploaded file"})
+                duplicates.append({"row": i + 1, "title": title, "reason": "Duplicate title in uploaded file"})
+            # Check for title duplicate in Shopify
             elif title_lower in existing_products["titles"]:
-                existing_duplicates.append({"row": i + 1, "title": title, "reason": "Already exists in Shopify"})
-            elif sku and sku.lower() in existing_products["skus"]:
+                existing_duplicates.append({"row": i + 1, "title": title, "reason": "Title already exists in Shopify"})
+            # Check for SKU duplicate in Shopify
+            elif sku_lower and sku_lower in existing_products["skus"]:
                 existing_duplicates.append({"row": i + 1, "title": title, "sku": sku, "reason": "SKU already exists in Shopify"})
+            # Check for handle duplicate in Shopify
+            elif handle_lower and handle_lower in existing_products["handles"]:
+                existing_duplicates.append({"row": i + 1, "title": title, "handle": handle, "reason": "Handle already exists in Shopify"})
+            # Check for duplicate handle in uploaded file
+            elif handle_lower and handle_lower in seen_handles:
+                duplicates.append({"row": i + 1, "title": title, "handle": handle, "reason": "Duplicate handle in uploaded file"})
             else:
                 valid_count += 1
 
             seen_titles.add(title_lower)
-            if sku:
-                seen_skus.add(sku.lower())
+            if sku_lower:
+                seen_skus.add(sku_lower)
+            if handle_lower:
+                seen_handles.add(handle_lower)
 
     all_issues = errors + duplicates + existing_duplicates
     return {
         "valid": len(all_issues) == 0,
         "error_count": len(errors),
-        "duplicate_count": len(duplicates) + len(existing_duplicates),
+        "duplicate_count": len(duplicates),
+        "existing_duplicate_count": len(existing_duplicates),
         "errors": errors,
         "duplicates": duplicates,
         "existing_duplicates": existing_duplicates,
         "total": len(products),
-        "valid_products": valid_count
+        "valid_products": valid_count,
+        "summary": {
+            "will_be_uploaded": valid_count,
+            "will_be_skipped": len(duplicates) + len(existing_duplicates),
+            "has_errors": len(errors) > 0
+        }
     }
 
 
 @router.post("/push-to-shopify")
 async def push_to_shopify(products: List[dict]):
+    """
+    Upload products to Shopify with comprehensive duplicate checking.
+    
+    This endpoint:
+    1. Fetches all existing Shopify products (CRITICAL)
+    2. Filters out any duplicates by title, SKU, or handle
+    3. Groups multi-variant products
+    4. Creates only new products
+    """
     try:
         client = get_shopify_client()
         results = {
@@ -192,51 +248,95 @@ async def push_to_shopify(products: List[dict]):
             "skipped_count": 0
         }
 
-        # Fetch existing products FRESH before every push
-        print("🔍 Fetching existing Shopify products before push...")
-        existing_products = get_existing_products()
-        print(f"🔍 Found {len(existing_products['titles'])} existing titles to check against")
+        # STEP 1: Fetch FRESH existing products before every push
+        print("\n" + "="*80)
+        print("🔍 STEP 1: Fetching existing Shopify products...")
+        print("="*80)
+        try:
+            existing_products = get_existing_products()
+        except HTTPException as e:
+            # Critical error - can't proceed without knowing what exists
+            print(f"❌ CRITICAL: Cannot continue without duplicate check: {e.detail}")
+            raise
+        
+        print(f"✅ STEP 1 Complete: Will check all uploads against {len(existing_products['titles'])} existing titles\n")
 
-        seen_titles = set()  # track titles within this upload batch
+        seen_titles = set()      # track titles within this upload batch
+        seen_skus = set()        # track SKUs within this upload batch
+        seen_handles = set()     # track handles within this upload batch
 
-        # Group rows by Handle for multi-variant products
+        # STEP 2: Group rows by Handle for multi-variant products
+        print("="*80)
+        print("🔍 STEP 2: Processing and grouping products...")
+        print("="*80)
+        
         grouped = {}
-        for row in products:
+        skipped_rows = []
+        
+        for row_idx, row in enumerate(products):
             handle = (row.get("Handle") or row.get("handle") or row.get("HANDLE") or "").strip()
             title = (row.get("Title") or row.get("title") or row.get("TITLE") or "").strip()
+            sku = (row.get("Variant SKU") or row.get("sku") or row.get("VARIANT SKU") or "").strip()
 
             if not handle and not title:
                 continue
 
             key = handle or title
-            title_lower = title.lower().strip()
+            title_lower = (title or "").lower().strip()
+            sku_lower = (sku or "").lower().strip() if sku else ""
+            handle_lower = (handle or "").lower().strip() if handle else ""
 
-            # DUPLICATE CHECK 1: variant row for already-grouped product
-            if title_lower and title_lower in seen_titles:
-                if key in grouped:
-                    _add_variant_to_group(grouped[key], row)
-                continue
+            skip_reason = None
 
-            # DUPLICATE CHECK 2: already exists in Shopify by title
-            if title_lower and title_lower in existing_products["titles"]:
-                print(f"⏭️ Skipping '{title}' — already exists in Shopify")
-                results["skipped"].append({"title": title, "reason": "Already exists in Shopify"})
+            # ✋ DUPLICATE CHECK 0: SKU already exists in Shopify
+            if sku_lower:
+                if sku_lower in existing_products["skus"]:
+                    skip_reason = f"SKU '{sku}' already exists in Shopify"
+                elif sku_lower in seen_skus:
+                    skip_reason = f"SKU '{sku}' is duplicate within uploaded file"
+
+            # ✋ DUPLICATE CHECK 1: Product title already exists in Shopify
+            if not skip_reason and title_lower:
+                if title_lower in existing_products["titles"]:
+                    skip_reason = f"Title '{title}' already exists in Shopify"
+                elif title_lower in seen_titles:
+                    # This is a variant row for an already-seen product, add it
+                    if key in grouped:
+                        existing_variant_skus = [v.get("sku", "").lower().strip() for v in grouped[key]["variants"]]
+                        if sku_lower and sku_lower not in existing_variant_skus:
+                            _add_variant_to_group(grouped[key], row)
+                            if sku_lower:
+                                seen_skus.add(sku_lower)
+                    continue
+
+            # ✋ DUPLICATE CHECK 2: Handle already exists in Shopify
+            if not skip_reason and handle_lower:
+                if handle_lower in existing_products["handles"]:
+                    skip_reason = f"Handle '{handle}' already exists in Shopify"
+                elif handle_lower in seen_handles:
+                    skip_reason = f"Handle '{handle}' is duplicate within uploaded file"
+
+            # If we should skip this row, log it
+            if skip_reason:
+                print(f"⏭️  Row {row_idx + 1}: SKIPPED — {skip_reason}")
+                results["skipped"].append({
+                    "row": row_idx + 1,
+                    "title": title or "(no title)",
+                    "reason": skip_reason
+                })
                 results["skipped_count"] += 1
+                skipped_rows.append(row)
                 continue
 
-            # DUPLICATE CHECK 3: handle already exists in Shopify
-            if handle and handle.lower() in existing_products["handles"]:
-                print(f"⏭️ Skipping '{title}' — handle already exists")
-                results["skipped"].append({"title": title, "reason": f"Handle '{handle}' already exists in Shopify"})
-                results["skipped_count"] += 1
-                continue
-
-            # New product — add to group
+            # ✅ This is a new product — add to group
             if title_lower:
                 seen_titles.add(title_lower)
+            if sku_lower:
+                seen_skus.add(sku_lower)
+            if handle_lower:
+                seen_handles.add(handle_lower)
 
             if key not in grouped:
-                # Extract status from row with fallbacks, default to "active"
                 status = (row.get("Status") or row.get("status") or row.get("STATUS") or "").strip().lower()
                 if status not in ["active", "draft", "archived"]:
                     status = "active"
@@ -254,18 +354,21 @@ async def push_to_shopify(products: List[dict]):
                     "seo_description": ""
                 }
                 
-                # Store SEO data (don't include in product data, will set after creation)
                 grouped[key]["seo_title"] = row.get("SEO TITLE") or row.get("Seo Title") or row.get("SEO Title") or row.get("seo_title") or ""
                 grouped[key]["seo_description"] = row.get("SEO DESCRIPTION") or row.get("Seo Description") or row.get("SEO Description") or row.get("seo_description") or ""
 
             _add_variant_to_group(grouped[key], row)
 
+        print(f"✅ STEP 2 Complete: {len(grouped)} new products to create, {results['skipped_count']} will be skipped\n")
         results["total"] = len(grouped) + results["skipped_count"]
 
-        # Push each unique product to Shopify
-        for key, product_data in grouped.items():
+        # STEP 3: Create products in Shopify
+        print("="*80)
+        print(f"🚀 STEP 3: Uploading {len(grouped)} new products...")
+        print("="*80)
+        
+        for product_idx, (key, product_data) in enumerate(grouped.items(), 1):
             try:
-                # Extract SEO data before sending to API
                 seo_title = product_data.pop("seo_title", "")
                 seo_desc = product_data.pop("seo_description", "")
                 
@@ -274,13 +377,14 @@ async def push_to_shopify(products: List[dict]):
                 if not product_data["images"]:
                     del product_data["images"]
 
-                print(f"🚀 Creating: {product_data.get('title')}")
+                title = product_data.get("title")
+                print(f"  [{product_idx}/{len(grouped)}] 🚀 Creating: {title}")
+                
                 try:
                     r = client.create_product(product_data)
                 except _requests.exceptions.HTTPError as http_err:
-                    # On 401 (token expired mid-upload), refresh the client and retry once
                     if http_err.response is not None and http_err.response.status_code == 401:
-                        print(f"🔄 Token expired mid-upload, refreshing...")
+                        print(f"      🔄 Token expired, refreshing...")
                         client = get_shopify_client()
                         r = client.create_product(product_data)
                     else:
@@ -288,32 +392,42 @@ async def push_to_shopify(products: List[dict]):
                 
                 product_id = r.get("product", {}).get("id")
                 
-                # Set SEO data after product creation
                 if product_id and (seo_title or seo_desc):
                     try:
-                        print(f"📝 Setting SEO for product {product_id}")
+                        print(f"      📝 Setting SEO...")
                         client.set_product_seo(product_id, title=seo_title or None, description=seo_desc or None)
-                        print(f"✅ SEO set successfully")
                     except Exception as seo_err:
-                        print(f"⚠️ Warning: Failed to set SEO data: {seo_err}")
-                        # Don't fail the product creation if SEO fails
+                        print(f"      ⚠️  SEO failed (non-blocking): {seo_err}")
                 
                 results["success"].append({
-                    "title": product_data.get("title"),
+                    "title": title,
                     "id": product_id
                 })
                 results["created"] += 1
+                print(f"      ✅ Created successfully (ID: {product_id})")
+                
             except Exception as e:
-                print(f"❌ Failed: {product_data.get('title')} — {e}")
+                error_msg = str(e)
+                print(f"      ❌ FAILED: {error_msg}")
                 results["errors"].append({
                     "title": product_data.get("title"),
-                    "error": str(e)
+                    "error": error_msg
                 })
 
-        print(f"✅ Done: {results['created']} created, {results['skipped_count']} skipped, {len(results['errors'])} errors")
+        print("\n" + "="*80)
+        print(f"📊 FINAL RESULTS:")
+        print(f"  ✅ Created:  {results['created']}")
+        print(f"  ⏭️  Skipped: {results['skipped_count']}")
+        print(f"  ❌ Errors:   {len(results['errors'])}")
+        print(f"  📦 Total:    {results['total']}")
+        print("="*80 + "\n")
+        
         return results
 
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"❌ FATAL ERROR: {e}")
         raise HTTPException(status_code=400, detail=str(e))
 
 

@@ -1,14 +1,36 @@
 from fastapi import FastAPI
 from starlette.requests import Request
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Receive, Scope, Send, Message
+from starlette.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from pathlib import Path
 import asyncio, os, time, logging
+import hashlib
+import json
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
+
+# ── Configure logging for production efficiency ────────────────────────────────
+IS_PRODUCTION = os.getenv("ENVIRONMENT", "development").lower() == "production"
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO" if IS_PRODUCTION else "DEBUG").upper()
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL),
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s' if not IS_PRODUCTION 
+           else '%(levelname)s - %(message)s',
+)
+
+# Reduce noise from uvicorn access logs in production
+if IS_PRODUCTION:
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn").setLevel(logging.WARNING)
+else:
+    logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+
+logger = logging.getLogger(__name__)
 
 from routes import products, collections, inventory, upload, export, auth, metafields, users
 from routes.store_utils import get_connected_store, load_all_user_stores, save_stores, set_request_user_id
@@ -16,7 +38,79 @@ from routes.auth_utils import resolve_user_id_from_request
 from routes.user_utils import initialize_admin_user
 import requests
 
-logger = logging.getLogger(__name__)
+
+# ── Performance Monitoring Middleware ──────────────────────────────────────────
+class PerformanceMiddleware:
+    """Track response times and add performance headers."""
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        start_time = time.time()
+        
+        async def send_wrapper(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                process_time = (time.time() - start_time) * 1000
+                message["headers"] = [
+                    *message.get("headers", []),
+                    (b"x-process-time", f"{process_time:.2f}ms".encode()),
+                ]
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
+# ── ETag Support for Conditional Requests ──────────────────────────────────────
+class ETagMiddleware:
+    """Add ETag headers for cacheability."""
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope.get("type") != "http" or scope["method"] not in ["GET", "HEAD"]:
+            await self.app(scope, receive, send)
+            return
+
+        request = Request(scope)
+        if_none_match = request.headers.get("If-None-Match")
+        
+        response_started = False
+        etag_header = None
+        
+        async def send_wrapper(message: Message) -> None:
+            nonlocal response_started, etag_header
+            
+            if message["type"] == "http.response.start":
+                response_started = True
+                # Will add ETag in http.response.body
+                
+            elif message["type"] == "http.response.body":
+                if response_started and not etag_header:
+                    body = message.get("body", b"")
+                    if body:
+                        # Generate ETag from response body
+                        etag = hashlib.md5(body).hexdigest()
+                        etag_header = etag
+                        
+                        # Check If-None-Match
+                        if if_none_match == f'"{etag}"':
+                            message["status"] = 304
+                            message["body"] = b""
+                        else:
+                            # Add ETag header to successful responses
+                            if hasattr(message, "headers"):
+                                message["headers"] = [
+                                    *message.get("headers", []),
+                                    (b"etag", f'"{etag}"'.encode()),
+                                ]
+            
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
 
 
 class RequestUserContextMiddleware:
@@ -116,6 +210,12 @@ app = FastAPI(
 
 # Compress responses to reduce bandwidth for large JSON payloads
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Add performance monitoring (measures response time)
+app.add_middleware(PerformanceMiddleware)
+
+# Add ETag support for client-side caching
+app.add_middleware(ETagMiddleware)
 
 app.add_middleware(
     CORSMiddleware,

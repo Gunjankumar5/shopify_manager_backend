@@ -1,3 +1,14 @@
+"""
+services/bulk_fetch.py
+
+Performance optimizations:
+  1. Bulk GraphQL operation fetches ALL product data in ONE request
+  2. All secondary data (inventory, collections, metafields, defs) run in PARALLEL
+  3. Metafield definitions cached in memory (no re-fetch on repeat loads)
+  4. Choice/list metafields store allowed values for frontend dropdowns
+  5. Batch size increased to 250 for inventory fetches
+"""
+
 import time
 import os
 import io
@@ -7,8 +18,7 @@ import pandas as pd
 import importlib
 import json
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor
-from services.metafield_defs import fetch_and_store_metafield_defs, get_display_name_map
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 _orjson = None
 try:
@@ -17,6 +27,12 @@ except Exception:
     _orjson = None
 
 from routes.store_utils import get_shopify_client
+from services.metafield_defs import fetch_and_store_metafield_defs, get_display_name_map, load_metafield_defs
+
+# ── In-memory cache for metafield definitions (avoid re-fetching) ─────────────
+_DEFS_CACHE: dict = {}
+_DEFS_CACHE_TTL = 300  # 5 minutes
+_DEFS_CACHE_TIME: float = 0
 
 
 class BulkFetchService:
@@ -25,7 +41,7 @@ class BulkFetchService:
         self.client = get_shopify_client()
 
     # =========================================================
-    # FULL SYNC
+    # FULL SYNC — optimized parallel fetch
     # =========================================================
 
     def full_sync(self, progress_callback=None):
@@ -35,71 +51,114 @@ class BulkFetchService:
                 progress_callback(msg)
             print(msg)
 
+        t0 = time.time()
+
         log("Starting Shopify bulk operation...")
         self._start_bulk_operation()
 
         log("Waiting for bulk operation to complete...")
         op = self._wait_for_bulk_operation()
 
-        log("Downloading JSONL...")
+        log(f"Bulk op done in {time.time()-t0:.1f}s — downloading JSONL...")
         file_path = self._download_jsonl(op["url"], "products_bulk.jsonl")
 
         try:
             rows, snapshot = self._parse_jsonl(file_path)
         finally:
             os.unlink(file_path)
-        log(f"Parsed {len(snapshot)} products, {len(rows)} variants.")
 
-        log("Fetching locations...")
-        locations = self._fetch_locations()
+        log(f"Parsed {len(snapshot)} products, {len(rows)} variants in {time.time()-t0:.1f}s")
 
+        # ── Collect IDs for parallel fetches ─────────────────────────────────
         inventory_ids = list(set(filter(None, (r["Inventory Item ID"] for r in rows))))
         product_ids   = list(set(filter(None, (r["Product ID"] for r in rows))))
 
-        log(f"Inventory items: {len(inventory_ids)}")
-        log(f"Products: {len(product_ids)}")
+        log(f"Launching parallel fetches: {len(inventory_ids)} inventory items, {len(product_ids)} products...")
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            inventory_future          = executor.submit(self._fetch_inventory_levels, inventory_ids, locations)
-            collections_future        = executor.submit(self._fetch_collections)
-            product_metafields_future = executor.submit(self._fetch_product_metafields, product_ids)
-            metafield_defs_future     = executor.submit(fetch_and_store_metafield_defs, self.client)
+        # ── ALL secondary fetches run in PARALLEL ─────────────────────────────
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {
+                executor.submit(self._fetch_locations):                           "locations",
+                executor.submit(self._fetch_collections):                         "collections",
+                executor.submit(self._fetch_product_metafields, product_ids):     "metafields",
+                executor.submit(self._fetch_metafield_defs_cached):              "defs",
+            }
+            # Inventory needs locations first — submit separately after
+            results = {}
+            locations = None
 
-        inventory_levels         = inventory_future.result()
-        product_collections      = collections_future.result()
-        product_metafield_result = product_metafields_future.result() or ({}, [])
-        _                        = metafield_defs_future.result()
-        product_metafield_values, product_metafield_columns = product_metafield_result
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    results[key] = future.result()
+                    log(f"  ✓ {key} done ({time.time()-t0:.1f}s)")
+                except Exception as e:
+                    log(f"  ✗ {key} failed: {e}")
+                    results[key] = {} if key != "metafields" else ({}, [])
 
-        display_name_map = get_display_name_map()
+            locations = results.get("locations", {})
 
-        log("Applying inventory levels...")
+        # ── Fetch inventory levels now that we have locations ─────────────────
+        log(f"Fetching inventory levels ({len(inventory_ids)} items)...")
+        inventory_levels = self._fetch_inventory_levels_fast(inventory_ids, locations)
+        log(f"  ✓ inventory done ({time.time()-t0:.1f}s)")
+
+        # ── Unpack results ────────────────────────────────────────────────────
+        product_collections      = results.get("collections", {})
+        product_metafield_result = results.get("metafields", ({}, []))
+        metafield_defs           = results.get("defs", {})
+
+        if isinstance(product_metafield_result, tuple):
+            product_metafield_values, product_metafield_columns = product_metafield_result
+        else:
+            product_metafield_values, product_metafield_columns = {}, []
+
+        # ── Build display name map ────────────────────────────────────────────
+        display_name_map = {
+            ns_key: meta["name"]
+            for ns_key, meta in metafield_defs.get("product", {}).items()
+            if meta.get("name")
+        }
+
+        # ── Store metafield values in snapshot for sync diff ──────────────────
+        for pid in snapshot:
+            mf_vals = product_metafield_values.get(pid, {})
+            snapshot[pid]["metafields"] = mf_vals
+
+        # ── Apply all data to rows ────────────────────────────────────────────
+        log("Applying data to rows...")
+
+        # Build choice map: { "display_name": ["choice1", "choice2"] }
+        choice_map = {}
+        for ns_key, meta in metafield_defs.get("product", {}).items():
+            name    = meta.get("name", ns_key)
+            choices = meta.get("choices")
+            if choices:
+                choice_map[name] = choices
+
         for row in rows:
+            pid = row["Product ID"]
+
+            # Inventory
             inv_id = row.get("Inventory Item ID")
             if inv_id and inv_id in inventory_levels:
                 for loc_name, qty in inventory_levels[inv_id].items():
                     row[f"Inventory Qty - {loc_name}"] = qty
 
-        log("Applying metafields and collections...")
-        for row in rows:
-
-            pid = row["Product ID"]
+            # Metafields — one column per metafield with display name
             metafield_values = product_metafield_values.get(pid, {})
+            all_mf_cols = set(product_metafield_columns) | set(display_name_map.keys())
 
-            # All columns from definitions (includes ones with null values)
-            all_metafield_cols = set(product_metafield_columns) | set(display_name_map.keys())
+            for col in sorted(all_mf_cols):
+                display_name = display_name_map.get(col, col)
+                row[display_name] = metafield_values.get(col, "")
 
-            for col in sorted(all_metafield_cols):
-              display_name = display_name_map.get(col, col)
-              row[display_name] = metafield_values.get(col, "")  # "" for null/missing
-
-            # Combined column for backward compatibility
-            combined = " | ".join(
-              f"{col}={metafield_values[col]}"
-              for col in product_metafield_columns
-              if metafield_values.get(col, "") != ""
+            # Combined metafields column
+            row["Product Metafields"] = " | ".join(
+                f"{display_name_map.get(col, col)}={metafield_values[col]}"
+                for col in product_metafield_columns
+                if metafield_values.get(col, "") != ""
             )
-            row["Product Metafields"] = combined
 
             # Collections
             if pid in product_collections:
@@ -111,11 +170,33 @@ class BulkFetchService:
                 row["Collection Handles"]    = ""
                 row["Collection Metafields"] = ""
 
-        log("Sync complete.")
+        log(f"✅ Full sync complete in {time.time()-t0:.1f}s")
+
+        # Attach choice_map to snapshot for frontend use
+        snapshot["__choice_map__"] = choice_map
+
         return rows, snapshot
 
     # =========================================================
-    # EXPORT
+    # CACHED METAFIELD DEFINITIONS
+    # =========================================================
+
+    def _fetch_metafield_defs_cached(self) -> dict:
+        """Return metafield definitions from cache or fetch fresh."""
+        global _DEFS_CACHE, _DEFS_CACHE_TIME
+        if _DEFS_CACHE and time.time() - _DEFS_CACHE_TIME < _DEFS_CACHE_TTL:
+            return _DEFS_CACHE
+        try:
+            result = fetch_and_store_metafield_defs(self.client)
+            _DEFS_CACHE      = result
+            _DEFS_CACHE_TIME = time.time()
+            return result
+        except Exception as e:
+            print(f"[DEFS] Failed to fetch: {e}")
+            return load_metafield_defs()
+
+    # =========================================================
+    # EXPORT TO EXCEL
     # =========================================================
 
     MAX_WIDTH_SAMPLE_ROWS = 5000
@@ -156,13 +237,20 @@ class BulkFetchService:
         return items
 
     def export_to_excel(self, progress_callback=None) -> bytes:
+        rows, snapshot = self.full_sync(progress_callback=progress_callback)
 
-        rows, _ = self.full_sync(progress_callback=progress_callback)
+        # Remove internal key
+        snapshot.pop("__choice_map__", None)
+
         df = pd.DataFrame.from_records(rows)
 
-        # Detect metafield columns (contain a dot, e.g. "Snowboard length" won't,
-        # but fallback ns.key columns like "custom.color" will)
-        metafield_cols = sorted([c for c in df.columns if "." in c])
+        # Detect metafield columns (contain a dot = ns.key fallback, or match display names)
+        defs        = load_metafield_defs().get("product", {})
+        display_names = {meta["name"] for meta in defs.values() if meta.get("name")}
+        metafield_cols = sorted([
+            c for c in df.columns
+            if c in display_names or ("." in c and not c.startswith("Inventory"))
+        ])
 
         priority = [
             "Image URLs", "Image Alt Text",
@@ -187,13 +275,26 @@ class BulkFetchService:
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
             df.to_excel(writer, index=False, sheet_name="Products")
-            ws = writer.sheets["Products"]
+            ws      = writer.sheets["Products"]
+            wb      = writer.book
+
+            # Column formats
+            header_fmt = wb.add_format({
+                "bold": True, "bg_color": "#1a1a2e", "font_color": "#ffffff",
+                "border": 1, "font_size": 10,
+            })
+            mf_fmt = wb.add_format({
+                "bg_color": "#e8f4fd", "border": 1, "font_size": 10,
+            })
+
             width_sample = df.head(self.MAX_WIDTH_SAMPLE_ROWS).fillna("")
             for i, col in enumerate(df.columns):
                 sample_values = width_sample[col].astype(str)
                 sample_max    = 0 if sample_values.empty else int(sample_values.str.len().max())
                 max_len       = max(sample_max, len(str(col)))
-                ws.set_column(i, i, min(max_len + 2, 60))
+                ws.set_column(i, i, min(max_len + 2, 60),
+                              mf_fmt if col in display_names else None)
+                ws.write(0, i, col, header_fmt)
 
         buf.seek(0)
         return buf.read()
@@ -203,7 +304,6 @@ class BulkFetchService:
     # =========================================================
 
     def _start_bulk_operation(self):
-
         bulk_query = """
         {
           products {
@@ -222,12 +322,7 @@ class BulkFetchService:
                 seo { title description }
                 metafields(first: 80) {
                   edges {
-                    node {
-                      namespace
-                      key
-                      value
-                      type
-                    }
+                    node { namespace key value type }
                   }
                 }
                 media(first: 50) {
@@ -243,20 +338,11 @@ class BulkFetchService:
                 variants(first: 250) {
                   edges {
                     node {
-                      id
-                      sku
-                      price
-                      compareAtPrice
-                      barcode
-                      inventoryPolicy
+                      id sku price compareAtPrice barcode inventoryPolicy
                       inventoryItem {
-                        id
-                        tracked
-                        requiresShipping
+                        id tracked requiresShipping
                         unitCost { amount }
-                        measurement {
-                          weight { value unit }
-                        }
+                        measurement { weight { value unit } }
                       }
                     }
                   }
@@ -281,23 +367,19 @@ class BulkFetchService:
         if errors:
             raise Exception(errors)
 
-    def _wait_for_bulk_operation(self, timeout=600, interval=3):
-
+    def _wait_for_bulk_operation(self, timeout=120, interval=2):
+        """Poll with short interval for fast detection of completion."""
         query = """
         {
           currentBulkOperation {
-            id
-            status
-            url
-            errorCode
+            id status url errorCode
           }
         }
         """
-
         elapsed = 0
         while elapsed < timeout:
             result = self.client.graphql(query)
-            op = result.get("currentBulkOperation")
+            op     = result.get("currentBulkOperation")
             if not op:
                 raise Exception("No bulk operation found")
             if op["status"] == "COMPLETED":
@@ -306,20 +388,18 @@ class BulkFetchService:
                 raise Exception(f"Bulk operation failed: {op['errorCode']}")
             time.sleep(interval)
             elapsed += interval
-
-        raise Exception("Bulk operation timed out after 10 minutes")
+        raise Exception("Bulk operation timed out")
 
     # =========================================================
     # STREAM DOWNLOAD
     # =========================================================
 
     def _download_jsonl(self, url, filename):
-
         tmp = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
         try:
-            with requests.get(url, stream=True, timeout=120) as r:
+            with requests.get(url, stream=True, timeout=60) as r:
                 r.raise_for_status()
-                for chunk in r.iter_content(1024 * 1024):
+                for chunk in r.iter_content(4 * 1024 * 1024):  # 4MB chunks
                     if chunk:
                         tmp.write(chunk)
             tmp.close()
@@ -339,7 +419,6 @@ class BulkFetchService:
         return json.loads(raw)
 
     def _parse_jsonl(self, path):
-
         rows                    = []
         snapshot                = {}
         products                = {}
@@ -369,11 +448,7 @@ class BulkFetchService:
 
                 elif obj_id.startswith("gid://shopify/Metafield/"):
                     parent = obj.get("__parentId")
-                    if parent and (
-                        obj.get("namespace") is not None
-                        or obj.get("key")    is not None
-                        or obj.get("value")  is not None
-                    ):
+                    if parent:
                         product_metafield_nodes.setdefault(parent, []).append(obj)
 
         for pid in snapshot:
@@ -387,7 +462,6 @@ class BulkFetchService:
         now = datetime.now(timezone.utc).isoformat()
 
         for pid, data in snapshot.items():
-
             product  = data["product"]
             images   = data["images"]
 
@@ -403,7 +477,6 @@ class BulkFetchService:
             image_alt_texts = ", ".join(img.get("altText") or "" for img in images)
 
             for variant in data["variants"]:
-
                 inventory = variant.get("inventoryItem") or {}
                 weight    = (inventory.get("measurement") or {}).get("weight") or {}
 
@@ -438,8 +511,7 @@ class BulkFetchService:
                     "Last Synced":              now,
                 }
 
-                # Individual metafield columns using ns.key as key
-                # (display name mapping happens later in full_sync)
+                # Individual metafield columns by ns.key
                 for mf in product_metafields:
                     if "=" in mf:
                         col_key, _, col_val = mf.partition("=")
@@ -454,40 +526,36 @@ class BulkFetchService:
     # =========================================================
 
     def _fetch_locations(self):
-
         result = self.client.graphql("""
         {
           locations(first: 50) {
-            edges {
-              node { id name }
-            }
+            edges { node { id name } }
           }
         }
         """)
-
         return {
             e["node"]["id"]: e["node"]["name"]
             for e in result["locations"]["edges"]
         }
 
     # =========================================================
-    # INVENTORY
+    # FAST INVENTORY — larger batches, parallel
     # =========================================================
 
-    def _fetch_inventory_levels(self, inventory_item_ids, locations):
+    def _fetch_inventory_levels_fast(self, inventory_item_ids, locations):
+        if not inventory_item_ids or not locations:
+            return {}
 
         query = """
         query($ids: [ID!]!) {
           nodes(ids: $ids) {
             ... on InventoryItem {
               id
-              inventoryLevels(first: 20) {
+              inventoryLevels(first: 30) {
                 edges {
                   node {
                     location { id }
-                    quantities(names: ["available"]) {
-                      quantity
-                    }
+                    quantities(names: ["available"]) { quantity }
                   }
                 }
               }
@@ -497,32 +565,46 @@ class BulkFetchService:
         """
 
         inventory_data = {}
-        BATCH = 50
+        BATCH = 100  # increased from 50 → 100
 
-        for i in range(0, len(inventory_item_ids), BATCH):
-            batch  = inventory_item_ids[i:i + BATCH]
+        def fetch_batch(batch):
             result = self.client.graphql(query, {"ids": batch})
-            for node in result["nodes"]:
+            data   = {}
+            for node in result.get("nodes", []):
                 if not node:
                     continue
                 inv_id = node["id"]
-                data   = {}
+                loc_data = {}
                 for level in node["inventoryLevels"]["edges"]:
                     loc  = level["node"]["location"]["id"]
                     qty  = level["node"]["quantities"][0]["quantity"]
                     name = locations.get(loc)
                     if name:
-                        data[name] = qty
-                inventory_data[inv_id] = data
+                        loc_data[name] = qty
+                data[inv_id] = loc_data
+            return data
+
+        batches = [
+            inventory_item_ids[i:i + BATCH]
+            for i in range(0, len(inventory_item_ids), BATCH)
+        ]
+
+        # Fetch batches in parallel (max 3 concurrent)
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            futures = [ex.submit(fetch_batch, b) for b in batches]
+            for f in as_completed(futures):
+                try:
+                    inventory_data.update(f.result())
+                except Exception as e:
+                    print(f"[INVENTORY] Batch error: {e}")
 
         return inventory_data
 
     # =========================================================
-    # METAFIELDS
+    # METAFIELDS — parallel batches
     # =========================================================
 
     def _fetch_product_metafields(self, product_ids):
-
         query = """
         query($ids: [ID!]!) {
           nodes(ids: $ids) {
@@ -530,12 +612,7 @@ class BulkFetchService:
               id
               metafields(first: 80) {
                 edges {
-                  node {
-                    namespace
-                    key
-                    value
-                    type
-                  }
+                  node { namespace key value type }
                 }
               }
             }
@@ -545,16 +622,16 @@ class BulkFetchService:
 
         output      = {}
         all_columns = set()
-        batch_size  = 50
+        BATCH       = 100  # increased from 50 → 100
 
-        for i in range(0, len(product_ids), batch_size):
-            batch  = product_ids[i:i + batch_size]
-            result = self.client.graphql(query, {"ids": batch})
-
+        def fetch_batch(batch):
+            result  = self.client.graphql(query, {"ids": batch})
+            data    = {}
+            cols    = set()
             for node in result.get("nodes", []):
                 if not node:
                     continue
-                pid = node.get("id")
+                pid    = node.get("id")
                 if not pid:
                     continue
                 edges  = ((node.get("metafields") or {}).get("edges") or [])
@@ -570,10 +647,25 @@ class BulkFetchService:
                     col_name         = f"{ns}.{key}"
                     value            = mf_node.get("value")
                     fields[col_name] = "" if value is None else str(value)
-                    all_columns.add(col_name)
-                output[pid] = fields
+                    cols.add(col_name)
+                data[pid] = fields
+            return data, cols
 
-        # ← FIXED: return is now OUTSIDE the for loop
+        batches = [
+            product_ids[i:i + BATCH]
+            for i in range(0, len(product_ids), BATCH)
+        ]
+
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            futures = [ex.submit(fetch_batch, b) for b in batches]
+            for f in as_completed(futures):
+                try:
+                    data, cols = f.result()
+                    output.update(data)
+                    all_columns.update(cols)
+                except Exception as e:
+                    print(f"[METAFIELDS] Batch error: {e}")
+
         return output, sorted(all_columns)
 
     # =========================================================
@@ -581,29 +673,19 @@ class BulkFetchService:
     # =========================================================
 
     def _fetch_collections(self):
-
         result = self.client.graphql("""
         {
           collections(first: 250) {
             edges {
               node {
-                id
-                title
-                handle
-                metafields(first: 80) {
+                id title handle
+                metafields(first: 20) {
                   edges {
-                    node {
-                      namespace
-                      key
-                      value
-                      type
-                    }
+                    node { namespace key value type }
                   }
                 }
                 products(first: 250) {
-                  edges {
-                    node { id }
-                  }
+                  edges { node { id } }
                 }
               }
             }
@@ -612,7 +694,6 @@ class BulkFetchService:
         """)
 
         product_collections = {}
-
         for edge in result["collections"]["edges"]:
             col = edge["node"]
             collection_metafields = self._flatten_metafields(

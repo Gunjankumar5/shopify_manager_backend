@@ -294,6 +294,32 @@ def run_sync(
             push({"done": True, "error": str(e), "auth_error": True})
             return
 
+        # ── Fetch existing products for duplicate checking ──────────────────
+        existing_products = {"titles": set(), "skus": set(), "handles": set()}
+        try:
+            print(f"[SYNC] Fetching existing products from Shopify for duplicate detection...")
+            existing_result = client.get_products(fetch_all=True)
+            existing_prods = existing_result.get("products", [])
+            
+            for prod in existing_prods:
+                title = (prod.get("title", "") or "").lower().strip()
+                if title:
+                    existing_products["titles"].add(title)
+                handle = (prod.get("handle", "") or "").lower().strip()
+                if handle:
+                    existing_products["handles"].add(handle)
+                for variant in prod.get("variants", []):
+                    sku = (variant.get("sku", "") or "").lower().strip()
+                    if sku:
+                        existing_products["skus"].add(sku)
+            
+            _log(f"session={session_id} loaded {len(existing_prods)} existing products")
+            _log(f"session={session_id} existing: {len(existing_products['titles'])} titles, {len(existing_products['skus'])} SKUs, {len(existing_products['handles'])} handles")
+        except Exception as e:
+            _log(f"session={session_id} ERROR: Could not fetch existing products: {e}")
+            push({"done": True, "error": f"Failed to fetch existing products for duplicate check: {str(e)}", "critical_error": True})
+            return
+
         # ── Build metafield lookup once for all rows ──────────────────────
         display_to_nskey, nskey_to_type = _build_metafield_lookup()
         _log(f"session={session_id} metafield_defs loaded: {len(display_to_nskey)} columns mapped")
@@ -313,6 +339,45 @@ def run_sync(
             variant_gid = row.get("Variant ID", "")
             product_id  = _numeric_id(product_gid)
             variant_id  = _numeric_id(variant_gid)
+
+            # ── Check for duplicates if this is a new product row (no valid Product ID) ──
+            if not product_id.isdigit():
+                title = (row.get("Title") or "").strip()
+                title_lower = title.lower() if title else ""
+                sku = (row.get("Variant SKU") or "").strip()
+                sku_lower = sku.lower() if sku else ""
+                handle = (row.get("Handle") or "").strip()
+                handle_lower = handle.lower() if handle else ""
+                
+                # NEW PRODUCT ROW — Check if it would be a duplicate before allowing sync
+                _log(f"session={session_id} row={idx+1} NEW PRODUCT CHECK: title='{title}', sku='{sku}', handle='{handle}'")
+                
+                # Check if this would be a duplicate
+                if title_lower and title_lower in existing_products["titles"]:
+                    error_msg = f"❌ Product '{title}' already exists in Shopify (duplicate title)"
+                    push({"row_index": idx, "variant_id": variant_gid, "status": "SKIPPED_DUPLICATE", "changes": [], "error": error_msg})
+                    counts["skipped"] += 1
+                    _log(f"session={session_id} row={idx+1} SKIPPED_DUPLICATE (title) {error_msg}")
+                    continue
+                elif sku_lower and sku_lower in existing_products["skus"]:
+                    error_msg = f"❌ SKU '{sku}' already exists in Shopify (duplicate SKU)"
+                    push({"row_index": idx, "variant_id": variant_gid, "status": "SKIPPED_DUPLICATE", "changes": [], "error": error_msg})
+                    counts["skipped"] += 1
+                    _log(f"session={session_id} row={idx+1} SKIPPED_DUPLICATE (sku) {error_msg}")
+                    continue
+                elif handle_lower and handle_lower in existing_products["handles"]:
+                    error_msg = f"❌ Handle '{handle}' already exists in Shopify (duplicate handle)"
+                    push({"row_index": idx, "variant_id": variant_gid, "status": "SKIPPED_DUPLICATE", "changes": [], "error": error_msg})
+                    counts["skipped"] += 1
+                    _log(f"session={session_id} row={idx+1} SKIPPED_DUPLICATE (handle) {error_msg}")
+                    continue
+                else:
+                    # New product row without valid Product ID and not a known duplicate
+                    error_msg = f"⚠️  New product (no Product ID) — skipped. Use Upload feature to add new products, not Sync. Title: '{title}'"
+                    push({"row_index": idx, "variant_id": variant_gid, "status": "SKIPPED_NEW_PRODUCT", "changes": [], "error": error_msg})
+                    counts["skipped"] += 1
+                    _log(f"session={session_id} row={idx+1} SKIPPED_NEW_PRODUCT {error_msg}")
+                    continue
 
             # ── Validate Product ID format ────────────────────────────────
             if not product_id.isdigit():

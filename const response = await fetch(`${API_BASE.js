@@ -1,1 +1,0 @@
-const response = await fetch(`${API_BASE_URL}/products/${query}`);

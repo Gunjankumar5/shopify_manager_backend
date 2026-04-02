@@ -148,25 +148,31 @@ def connect_store(req: ConnectRequest, user_id: str = Depends(require_authentica
 
 @router.get("/stores")
 def list_stores(user_id: str = Depends(require_authenticated_user)):
-    stores = load_stores(user_id=user_id)
-    active_key = get_active_store_key(user_id=user_id)
-    return {
-        "stores": [
-            {
-                "shop_key": k,
-                "shop": s.get("shop"),
-                "shop_name": s.get("shop_name"),
-                "api_version": s.get("api_version"),
-                "connected_at": s.get("connected_at"),
-                "email": s.get("email", ""),
-                "currency": s.get("currency", ""),
-                "is_active": k == active_key,
-            }
-            for k, s in stores.items()
-        ],
-        "count": len(stores),
-        "active_store": active_key,
-    }
+    logger.info(f"[GET /auth/stores] Request from user: {user_id}")
+    try:
+        stores = load_stores(user_id=user_id)
+        active_key = get_active_store_key(user_id=user_id)
+        logger.info(f"[GET /auth/stores] Returning {len(stores)} stores for user {user_id}")
+        return {
+            "stores": [
+                {
+                    "shop_key": k,
+                    "shop": s.get("shop"),
+                    "shop_name": s.get("shop_name"),
+                    "api_version": s.get("api_version"),
+                    "connected_at": s.get("connected_at"),
+                    "email": s.get("email", ""),
+                    "currency": s.get("currency", ""),
+                    "is_active": k == active_key,
+                }
+                for k, s in stores.items()
+            ],
+            "count": len(stores),
+            "active_store": active_key,
+        }
+    except Exception as e:
+        logger.error(f"[GET /auth/stores] Error: {e}")
+        raise
 
 
 @router.get("/active-store")

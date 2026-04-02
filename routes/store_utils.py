@@ -71,11 +71,16 @@ def load_stores(user_id: str | None = None) -> dict:
             .select("*") \
             .eq("user_id", resolved) \
             .execute()
-        return {
-            row["shop_key"]: _row_to_store(row)
-            for row in (result.data or [])
-            if row.get("shop_key")
-        }
+        rows = result.data if isinstance(result.data, list) else []
+        stores: dict[str, dict] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            shop_key = row.get("shop_key")
+            if not shop_key:
+                continue
+            stores[str(shop_key)] = _row_to_store(row)
+        return stores
     except HTTPException:
         raise
     except Exception as e:
@@ -153,8 +158,12 @@ def get_active_store_key(user_id: str | None = None) -> str | None:
               .eq("is_active", True) \
               .limit(1) \
               .execute()
-        if r.data:
-            return r.data[0]["shop_key"]
+        if isinstance(r.data, list) and r.data:
+            first = r.data[0]
+            if isinstance(first, dict):
+                sk = first.get("shop_key")
+                if isinstance(sk, str):
+                    return sk
         # Fallback: most recently connected
         r = sb.table("connected_stores") \
               .select("shop_key") \
@@ -162,8 +171,12 @@ def get_active_store_key(user_id: str | None = None) -> str | None:
               .order("connected_at", desc=True) \
               .limit(1) \
               .execute()
-        if r.data:
-            return r.data[0]["shop_key"]
+        if isinstance(r.data, list) and r.data:
+            first = r.data[0]
+            if isinstance(first, dict):
+                sk = first.get("shop_key")
+                if isinstance(sk, str):
+                    return sk
         return None
     except Exception as e:
         logger.error(f"get_active_store_key error: {e}")
@@ -304,12 +317,17 @@ def load_all_user_stores() -> dict[str, dict]:
     """Load all stores across all users (admin/background tasks only)."""
     try:
         result = _get_supabase().table("connected_stores").select("*").execute()
+        rows = result.data if isinstance(result.data, list) else []
         all_stores: dict[str, dict] = {}
-        for row in (result.data or []):
-            uid      = row.get("user_id")
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            uid = row.get("user_id")
             shop_key = row.get("shop_key")
             if uid and shop_key:
-                all_stores.setdefault(uid, {})[shop_key] = _row_to_store(row)
+                uid_s = str(uid)
+                shop_key_s = str(shop_key)
+                all_stores.setdefault(uid_s, {})[shop_key_s] = _row_to_store(row)
         return all_stores
     except Exception as e:
         logger.error(f"load_all_user_stores error: {e}")

@@ -557,7 +557,7 @@ def find_duplicate_products():
         seen_titles = {}
         duplicates = []
         for product in products:
-            title = product.get("title", "").lower().strip()
+            title = (product.get("title") or "").lower().strip()
             pid = product.get("id")
             if not title:
                 continue
@@ -594,7 +594,7 @@ def remove_duplicate_products():
         errors = []
 
         for product in products:
-            title = product.get("title", "").lower().strip()
+            title = (product.get("title") or "").lower().strip()
             pid = product.get("id")
             if not title:
                 continue
