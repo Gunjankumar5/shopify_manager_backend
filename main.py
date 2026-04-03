@@ -217,14 +217,30 @@ app.add_middleware(PerformanceMiddleware)
 # Add ETag support for client-side caching
 app.add_middleware(ETagMiddleware)
 
+frontend_urls_env = os.getenv("FRONTEND_URLS", "")
+parsed_frontend_urls = [u.strip() for u in frontend_urls_env.split(",") if u.strip()]
+
+frontend_url_single = os.getenv("FRONTEND_URL", "").strip()
+
+cors_origins = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "https://shopify-management-frontend-dev-q7v.vercel.app",
+]
+
+if frontend_url_single:
+    cors_origins.append(frontend_url_single)
+
+cors_origins.extend(parsed_frontend_urls)
+
+# Keep order while removing duplicates
+cors_origins = list(dict.fromkeys(cors_origins))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3000",
-        "https://shopify-management-frontend-dev-q7v.vercel.app",
-    ],
+    allow_origins=cors_origins,
+    allow_origin_regex=r"https://shopify-management-frontend-.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
