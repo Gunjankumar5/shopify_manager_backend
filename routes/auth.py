@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header
 from pydantic import BaseModel
 import requests
 import time
 import logging
 from .store_utils import load_stores, save_stores, get_active_store_key, set_active_store_key
 from .auth_utils import require_authenticated_user
+from .users import get_current_user_full
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -91,7 +92,15 @@ class ConnectRequest(BaseModel):
 # ── Routes — NO /api/auth prefix here; main.py adds prefix="/api/auth" ────────
 
 @router.post("/connect")
-def connect_store(req: ConnectRequest, user_id: str = Depends(require_authenticated_user)):
+def connect_store(
+    req: ConnectRequest,
+    user_id: str = Depends(require_authenticated_user),
+    authorization: str = Header(None),
+):
+    caller = get_current_user_full(authorization)
+    if caller.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admin users can connect stores")
+
     logger.info(f"🔗 Connect request for: {req.shop_name}")
 
     shop = req.shop_name.strip().lower()
@@ -209,7 +218,15 @@ def set_active_store(shop_key: str, user_id: str = Depends(require_authenticated
 
 
 @router.delete("/stores/{shop_key}")
-def disconnect_store(shop_key: str, user_id: str = Depends(require_authenticated_user)):
+def disconnect_store(
+    shop_key: str,
+    user_id: str = Depends(require_authenticated_user),
+    authorization: str = Header(None),
+):
+    caller = get_current_user_full(authorization)
+    if caller.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admin users can disconnect stores")
+
     stores = load_stores(user_id=user_id)
     if shop_key not in stores:
         raise HTTPException(status_code=404, detail="Store not found")

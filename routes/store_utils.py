@@ -22,6 +22,25 @@ def get_request_user_id() -> str | None:
     return REQUEST_USER_ID.get()
 
 
+def resolve_store_owner_user_id(user_id: str | None) -> str | None:
+    """Managers/Juniors use their admin owner's stores; Admins use their own."""
+    if not user_id:
+        return None
+    try:
+        r = _get_supabase().table("users").select("id, role, created_by").eq("id", user_id).limit(1).execute()
+        row = r.data[0] if isinstance(r.data, list) and r.data else None
+        if not isinstance(row, dict):
+            return user_id
+        role = str(row.get("role") or "")
+        owner = row.get("created_by")
+        if role in ("manager", "junior") and owner:
+            return str(owner)
+        return str(row.get("id") or user_id)
+    except Exception as e:
+        logger.warning(f"resolve_store_owner_user_id fallback for {user_id}: {e}")
+        return user_id
+
+
 # ── Supabase client ───────────────────────────────────────────────────────────
 
 def _get_supabase():
@@ -62,7 +81,7 @@ def _row_to_store(row: dict) -> dict:
 
 def load_stores(user_id: str | None = None) -> dict:
     """Load all stores for a user. Returns { shop_key: store_dict }"""
-    resolved = user_id or get_request_user_id()
+    resolved = resolve_store_owner_user_id(user_id or get_request_user_id())
     if not resolved:
         return {}
     try:
@@ -90,7 +109,7 @@ def load_stores(user_id: str | None = None) -> dict:
 
 def save_stores(stores: dict, user_id: str | None = None):
     """Save multiple stores to Supabase."""
-    resolved = user_id or get_request_user_id()
+    resolved = resolve_store_owner_user_id(user_id or get_request_user_id())
     if not resolved:
         raise HTTPException(status_code=401, detail="Authentication required")
     for shop_key, store in stores.items():
@@ -99,7 +118,7 @@ def save_stores(stores: dict, user_id: str | None = None):
 
 def save_single_store(shop_key: str, store: dict, user_id: str | None = None):
     """Upsert a single store in Supabase."""
-    resolved = user_id or get_request_user_id()
+    resolved = resolve_store_owner_user_id(user_id or get_request_user_id())
     if not resolved:
         raise HTTPException(status_code=401, detail="Authentication required")
     try:
@@ -126,7 +145,7 @@ def save_single_store(shop_key: str, store: dict, user_id: str | None = None):
 
 def delete_store(shop_key: str, user_id: str | None = None):
     """Delete a store from Supabase."""
-    resolved = user_id or get_request_user_id()
+    resolved = resolve_store_owner_user_id(user_id or get_request_user_id())
     if not resolved:
         raise HTTPException(status_code=401, detail="Authentication required")
     try:
@@ -146,7 +165,7 @@ def delete_store(shop_key: str, user_id: str | None = None):
 
 def get_active_store_key(user_id: str | None = None) -> str | None:
     """Get active store key for a user from Supabase."""
-    resolved = user_id or get_request_user_id()
+    resolved = resolve_store_owner_user_id(user_id or get_request_user_id())
     if not resolved:
         return None
     try:
@@ -185,7 +204,7 @@ def get_active_store_key(user_id: str | None = None) -> str | None:
 
 def set_active_store_key(shop_key: str | None, user_id: str | None = None):
     """Set active store for a user in Supabase."""
-    resolved = user_id or get_request_user_id()
+    resolved = resolve_store_owner_user_id(user_id or get_request_user_id())
     if not resolved:
         raise HTTPException(status_code=401, detail="Authentication required")
     try:
@@ -239,7 +258,7 @@ def _refresh_store_token(shop_key: str, store: dict, user_id: str | None = None)
 
 def get_connected_store(shop_key: str | None = None, user_id: str | None = None) -> dict | None:
     """Return active store dict, auto-refreshing token if expiring soon."""
-    resolved = user_id or get_request_user_id()
+    resolved = resolve_store_owner_user_id(user_id or get_request_user_id())
     if not resolved:
         return None
     try:
@@ -264,7 +283,7 @@ def get_shopify_client(shop_key: str | None = None, user_id: str | None = None):
     """Return ShopifyClient initialised with active store credentials."""
     from shopify_client import ShopifyClient
 
-    resolved = user_id or get_request_user_id()
+    resolved = resolve_store_owner_user_id(user_id or get_request_user_id())
     if not resolved:
         raise HTTPException(status_code=401, detail="Authentication required")
 
@@ -302,7 +321,7 @@ def get_store_access_token(
     user_id: str | None = None,
 ) -> str | None:
     """Get access token for a store, optionally forcing refresh."""
-    resolved = user_id or get_request_user_id()
+    resolved = resolve_store_owner_user_id(user_id or get_request_user_id())
     store    = get_connected_store(shop_key=shop_key, user_id=resolved)
     if not store:
         return None
