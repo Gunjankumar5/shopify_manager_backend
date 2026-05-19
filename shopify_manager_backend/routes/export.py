@@ -1,0 +1,290 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# FILE 1: routes/export.py  — pass user_id to sync thread
+# ═══════════════════════════════════════════════════════════════════════════════
+
+"""
+routes/export.py
+
+Endpoints:
+  GET  /api/export/excel          → download .xlsx
+  GET  /api/export/json           → load grid rows + snapshot (for sync baseline)
+  POST /api/export/sync           → start sync (returns session_id)
+  WS   /api/export/sync/progress  → stream row-by-row progress
+  POST /api/export/grid-save      → simple push (no delta detection)
+"""
+
+import asyncio
+import json
+import time
+import threading
+import uuid
+from typing import Dict, Any, List
+
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import Response
+
+from services.bulk_fetch import BulkFetchService
+import os
+import threading
+import time as _time
+
+# Simple in-memory cache for export JSON to avoid re-running bulk op repeatedly
+_export_cache = {
+    "data": None,
+    "ts": 0,
+}
+_export_lock = threading.Lock()
+_EXPORT_TTL_SECONDS = 300  # 5 minutes
+from services.sync_bridge import (
+    get_queue, pop_queue, remove_queue, run_sync, DONE_SENTINEL
+)
+from .store_utils import get_shopify_client, get_request_user_id
+
+router = APIRouter()
+
+
+# ── Excel export ──────────────────────────────────────────────────────────────
+
+@router.get("/excel", summary="Export products to Excel")
+def export_excel():
+    try:
+        service = BulkFetchService()
+        excel_bytes = service.export_to_excel()
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return Response(
+        content=excel_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="shopify_products_export.xlsx"'},
+    )
+
+
+# ── JSON load (rows + snapshot) ───────────────────────────────────────────────
+
+@router.get("/json", summary="Load products as JSON rows + snapshot for sync")
+def export_json(request: Request):
+    """
+    Returns:
+      rows      — grid data
+      snapshot  — for sync delta detection
+      choice_map — { "Metafield Name": ["choice1", "choice2"] } for dropdown cells
+    """
+
+
+    # Allow enabling a local dev sample via env var or query param `?dev_sample=1`
+    q = str(request.query_params.get("dev_sample", "")).lower()
+    dev_sample = q in ("1", "true", "yes") or str(os.getenv("DEV_EXPORT_SAMPLE", "")).lower() in ("1", "true", "yes")
+    # Also allow localhost requests to use dev sample when no store is connected,
+    # but only if ALLOW_DEV_SHORTCUTS env var is enabled (opt-in).
+    try:
+        allow_dev = str(os.getenv("ALLOW_DEV_SHORTCUTS", "")).lower() in ("1", "true", "yes")
+        client_host = getattr(request.client, "host", "") or ""
+        if not dev_sample and allow_dev and client_host in ("127.0.0.1", "::1", "localhost"):
+            dev_sample = True
+    except Exception:
+        pass
+    # If developer explicitly requested a sample payload, skip the heavy bulk operation.
+    if dev_sample:
+        rows = [
+            {
+                "Product ID": "gid://shopify/Product/1001",
+                "Variant ID": "gid://shopify/ProductVariant/2001",
+                "Inventory Item ID": "3001",
+                "Handle": "sample-product",
+                "Title": "Sample Product",
+                "Vendor": "Acme",
+                "Type": "Sample",
+                "Variant Price": "19.99",
+            }
+        ]
+        snapshot = {
+            "gid://shopify/Product/1001": {
+                "id": "gid://shopify/Product/1001",
+                "title": "Sample Product",
+                "variants": [
+                    {"id": "gid://shopify/ProductVariant/2001", "inventory_item_id": "3001"}
+                ],
+            },
+                "__choice_map__": {
+                    # include choice_map keys that match the sample row headers
+                    "Type": ["Sample", "Demo", "Other"],
+                    "Vendor": ["Acme", "Acme Corp", "Acme Intl"]
+                },
+        }
+    else:
+        try:
+            service = BulkFetchService()
+            rows, snapshot = service.full_sync()
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # Extract choice_map from snapshot (added by bulk_fetch)
+    choice_map = snapshot.pop("__choice_map__", {})
+
+    cleaned = [
+        {k: ("" if v is None else v) for k, v in row.items()}
+        for row in rows
+    ]
+
+    return {
+        "rows":       cleaned,
+        "snapshot":   snapshot,
+        "count":      len(cleaned),
+        "choice_map": choice_map,   # ← frontend uses this for dropdown cells
+    }
+
+
+# ── Start sync ────────────────────────────────────────────────────────────────
+
+@router.post("/sync", status_code=202)
+def start_sync(body: Dict[str, Any]):
+    """
+    Body: { "rows": [...], "snapshot": {...}, "shop_key": "..." }
+    Returns: { "session_id": "...", "status": "running" }
+    """
+    rows     = body.get("rows", [])
+    snapshot = body.get("snapshot", {})
+    shop_key = body.get("shop_key")
+
+    if not rows:
+        raise HTTPException(status_code=400, detail="No rows provided")
+
+    # ── Capture user_id from current request context ──────────────────────────
+    user_id = get_request_user_id()
+
+    session_id = str(uuid.uuid4())
+    get_queue(session_id)  # register BEFORE thread starts
+    print(f"[EXCEL_SYNC] start requested session={session_id} rows={len(rows)} user={user_id}")
+
+    thread = threading.Thread(
+        target=run_sync,
+        args=(session_id, rows, snapshot, shop_key, user_id),  # ← pass user_id
+        daemon=True,
+    )
+    thread.start()
+    print(f"[EXCEL_SYNC] worker started session={session_id}")
+
+    return {"session_id": session_id, "status": "running"}
+
+
+# ── WebSocket: live sync progress ─────────────────────────────────────────────
+
+@router.websocket("/sync/progress")
+async def sync_progress_ws(websocket: WebSocket, session: str = ""):
+    await websocket.accept()
+    print(f"[EXCEL_SYNC] ws connected session={session or 'missing'}")
+
+    if not session:
+        await websocket.send_text(json.dumps({"error": "session param required"}))
+        await websocket.close()
+        return
+
+    # Wait up to 10s for queue
+    deadline = time.time() + 10
+    queue = None
+    while time.time() < deadline:
+        queue = pop_queue(session)
+        if queue is not None:
+            break
+        await asyncio.sleep(0.05)
+
+    if queue is None:
+        await websocket.send_text(json.dumps({"error": "Session not found"}))
+        await websocket.close()
+        return
+
+    try:
+        empty_ticks = 0
+        while True:
+            try:
+                msg = queue.get_nowait()
+                empty_ticks = 0
+            except Exception:
+                empty_ticks += 1
+                if empty_ticks > 6000:  # 300s max
+                    break
+                await asyncio.sleep(0.05)
+                continue
+
+            if msg == DONE_SENTINEL:
+                await asyncio.sleep(0.1)
+                while True:
+                    try:
+                        rem = queue.get_nowait()
+                        if rem != DONE_SENTINEL:
+                            await websocket.send_text(rem)
+                    except Exception:
+                        break
+                break
+
+            await websocket.send_text(msg)
+
+    except WebSocketDisconnect:
+        print(f"[EXCEL_SYNC] ws disconnected session={session}")
+    except Exception as e:
+        print(f"[WS] sync/progress error: {e}")
+    finally:
+        remove_queue(session)
+        print(f"[EXCEL_SYNC] ws closed session={session}")
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+# ── Simple grid-save (no delta detection) ────────────────────────────────────
+
+@router.post("/grid-save", summary="Quick push edits to Shopify via REST")
+def grid_save(payload: Dict[str, Any]):
+    changes: List[Dict] = payload.get("changes", [])
+    if not changes:
+        raise HTTPException(status_code=400, detail="No changes provided")
+
+    client = get_shopify_client()
+    updated, failed, errors = 0, 0, []
+
+    for row in changes:
+        raw_product_id = str(row.get("Product ID", ""))
+        raw_variant_id = str(row.get("Variant ID", ""))
+        try:
+            product_id = raw_product_id.split("/")[-1]
+            variant_id = raw_variant_id.split("/")[-1]
+        except Exception:
+            errors.append({"row": row.get("Title", "?"), "error": "Invalid IDs"})
+            failed += 1
+            continue
+
+        if not product_id.isdigit() or not variant_id.isdigit():
+            errors.append({"row": row.get("Title", "?"), "error": "Bad IDs"})
+            failed += 1
+            continue
+
+        product_payload = {}
+        if row.get("Title"):       product_payload["title"]        = row["Title"]
+        if row.get("Body (HTML)"): product_payload["body_html"]    = row["Body (HTML)"]
+        if row.get("Vendor"):      product_payload["vendor"]       = row["Vendor"]
+        if row.get("Type"):        product_payload["product_type"] = row["Type"]
+        if row.get("Tags"):        product_payload["tags"]         = row["Tags"]
+        if row.get("Status"):      product_payload["status"]       = row["Status"].lower()
+
+        variant_payload = {"id": str(variant_id)}
+        if row.get("Variant Price"):            variant_payload["price"]            = str(row["Variant Price"])
+        if row.get("Variant Compare At Price"): variant_payload["compare_at_price"] = str(row["Variant Compare At Price"])
+        if row.get("Variant SKU"):              variant_payload["sku"]              = row["Variant SKU"]
+        if row.get("Variant Barcode"):          variant_payload["barcode"]          = row["Variant Barcode"]
+
+        try:
+            if product_payload:
+                client.update_product(product_id, product_payload)
+            variant_fields = {k: v for k, v in variant_payload.items() if k != "id"}
+            if variant_fields:
+                client.update_product_variant(product_id, variant_id, variant_payload)
+            updated += 1
+        except Exception as e:
+            errors.append({"row": row.get("Title", product_id), "error": str(e)})
+            failed += 1
+
+    return {"updated": updated, "failed": failed, "errors": errors}

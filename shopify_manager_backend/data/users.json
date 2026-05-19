@@ -1,0 +1,21 @@
+{
+  "user_f1d803b58bf3": {
+    "user_id": "user_f1d803b58bf3",
+    "email": "admin@shopmanager.local",
+    "full_name": "Admin User",
+    "role": "admin",
+    "permissions": {
+      "manage_products": true,
+      "manage_collections": true,
+      "manage_inventory": true,
+      "manage_metafields": true,
+      "manage_upload": true,
+      "manage_export": true,
+      "view_analytics": true,
+      "manage_users": true
+    },
+    "is_active": true,
+    "created_at": "2026-03-23T07:07:56.231463Z",
+    "last_login": null
+  }
+}
