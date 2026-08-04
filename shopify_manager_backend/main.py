@@ -184,12 +184,35 @@ async def lifespan(app: FastAPI):
         from routes.user_utils import load_users
         if not load_users():
             logger.info("🔧 Initializing default admin user for demo/testing...")
-            initialize_admin_user(
+            demo_admin_id = initialize_admin_user(
                 admin_user_id="demo_admin_user",
                 email="admin@shopmanager.local",
                 full_name="Admin User"
             )
-            logger.info("✅ Demo admin user created (user_id: demo_admin_user)")
+            logger.info(f"✅ Demo admin user created (user_id: {demo_admin_id})")
+
+            # Also create a matching Supabase Auth account so password login works
+            try:
+                from routes.users import _get_supabase_admin
+
+                demo_password = os.getenv("DEMO_ADMIN_PASSWORD", "admin12345").strip()
+                sb = _get_supabase_admin()
+                demo_email = "admin@shopmanager.local"
+                try:
+                    sb.auth.admin.create_user({
+                        "email": demo_email,
+                        "password": demo_password,
+                        "email_confirm": True,
+                        "user_metadata": {"full_name": "Admin User"},
+                    })
+                    logger.info("✅ Demo Supabase Auth user created for admin@shopmanager.local")
+                except Exception as create_error:
+                    if "already" in str(create_error).lower() or "registered" in str(create_error).lower():
+                        logger.info("ℹ️ Demo Supabase Auth user already exists")
+                    else:
+                        raise
+            except Exception as auth_seed_error:
+                logger.warning(f"Could not seed demo Supabase Auth user: {auth_seed_error}")
     except Exception as e:
         logger.warning(f"Could not initialize admin user: {e}")
 
