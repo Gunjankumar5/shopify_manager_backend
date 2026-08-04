@@ -14,7 +14,7 @@ const CollectionsPage = lazy(() => import("./pages/CollectionsPage"));
 const InventoryPage = lazy(() => import("./pages/InventoryPage"));
 const ConnectStore = lazy(() => import("./pages/ConnectStore"));
 const ExportPage = lazy(() => import("./pages/ExportPage"));
-const AuthPage = lazy(() => import("./pages/AuthPage"));
+const LoginPage = lazy(() => import("./pages/LoginPage"));
 const UserManagementPage = lazy(() => import("./pages/UserManagementPage"));
 const MetafieldsPage = lazy(() => import("./pages/MetafieldsPage"));
 
@@ -128,12 +128,12 @@ export default function App() {
     );
   }
 
-  // Not authenticated - show AuthPage
+  // Not authenticated - show the email/password login page
   if (!user) {
     return (
       <>
         <GlobalStyles />
-        <AuthPage onAuth={() => {}} />
+        <LoginPage />
       </>
     );
   }

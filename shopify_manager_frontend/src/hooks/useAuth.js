@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { supabase } from "../lib/supabaseClient";
+import { hasSupabaseConfig, supabase } from "../lib/supabaseClient";
 
 const API_ORIGIN = (import.meta.env.VITE_API_ORIGIN || "http://127.0.0.1:8000").replace(/\/$/, "");
 const API_BASE_URL = `${API_ORIGIN}/api`;
@@ -24,6 +24,17 @@ export function useAuth() {
   const onboardingAttemptedRef = useRef(new Set());
 
   useEffect(() => {
+    if (!hasSupabaseConfig || !supabase) {
+      console.error(
+        "[useAuth] Supabase is not configured. Check VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY.",
+      );
+      setUser(null);
+      setRole(null);
+      setPermissions({});
+      setLoading(false);
+      return;
+    }
+
     // Get current session on mount
     supabase.auth.getSession().then(({ data: { session } }) => {
       setUser(session?.user || null);
@@ -53,6 +64,8 @@ export function useAuth() {
   }, []);
 
   async function maybeApplySignupRole(authUser, userData) {
+    if (!supabase) return false;
+
     const desiredRole = String(authUser?.user_metadata?.desired_role || "")
       .trim()
       .toLowerCase();
@@ -101,6 +114,11 @@ export function useAuth() {
   }
 
   async function fetchUserDataOnce(authUser) {
+    if (!supabase) {
+      setLoading(false);
+      return;
+    }
+
     const userId = authUser?.id;
     if (!userId) return;
 
@@ -215,6 +233,16 @@ export function useAuth() {
   }
 
   async function signOut() {
+    if (!supabase) {
+      setUser(null);
+      setRole(null);
+      setPermissions({});
+      lastUserIdRef.current = null;
+      fetchInProgressRef.current = false;
+      setLoading(false);
+      return;
+    }
+
     await supabase.auth.signOut();
     setUser(null);
     setRole(null);
