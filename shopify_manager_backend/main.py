@@ -263,7 +263,7 @@ cors_origins = list(dict.fromkeys(cors_origins))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
-    allow_origin_regex=r"https://shopify-management-frontend-.*\.vercel\.app",
+    allow_origin_regex=r"https://shopify-(manager|management)-frontend(-.*)?\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
